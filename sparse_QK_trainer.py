@@ -1,3 +1,13 @@
+import torch as t
+from torch import Tensor, nn
+from torch.nn.functional import normalize
+import transformer_lens
+from transformer_lens import HookedTransformer
+from dataclasses import dataclass
+import math
+import torch.nn.functional as F
+import wandb
+
 class SparseQK(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -62,8 +72,7 @@ def train_sparse_QK(
     cfg,
     n_epochs: int,
     layer,
-    data,
-    dead_freq):
+    data):
     
     
     sparse_model = SparseQK(cfg = cfg).cuda()
@@ -100,7 +109,7 @@ def train_sparse_QK(
                   "loss": loss,
                   "reg_loss": reg_loss,
                   "l0": feature_fires / (feature_fires.shape(0)*(feature_fires.shape(1)**2)),
-                  "dead_features": (feature_freqs < dead_freq).sum()
+                  "dead_features": (feature_freqs < cfg["dead_freq"]).sum()
 
               })
 
