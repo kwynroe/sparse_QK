@@ -35,13 +35,12 @@ class SparseQK(nn.Module):
         acts = F.relu(acts)
         acts = pairwise_product = acts[:, :, :, 0, :] * acts[:, :, :, 1, :]
         reg_loss = self.reg_coeff * t.sqrt(acts.float().abs() + self.eps).sum()
-        l0_norm = (acts > 0).sum() / (acts.shape[0]*acts.shape[1]**2)
-        never_fired = (acts > 0).sum(0).sum(0).sum(0)
+        feature_fires = (acts > 0).sum()
         score_reconstr = einops.einsum(acts, self.W_dec, "batch posn_q posn_k d_hidden, d_hidden n_heads -> batch posn_q posn_k n_heads")/(self.d_head ** 0.5) + self.b_dec
         score_reconstr = einops.rearrange(score_reconstr, "batch posn_q posn_k n_heads -> batch n_heads posn_q posn_k")
         if masked:
           score_recostr = self.apply_causal_mask(score_reconstr)
-        return score_reconstr, reg_loss, l0_norm, never_fired
+        return score_reconstr, reg_loss, feature_fires, never_fired
 
     def apply_causal_mask(self, attn_scores: t.Tensor):
         mask = t.triu(t.ones(attn_scores.size(-2), attn_scores.size(-1), device=attn_scores.device), diagonal=1).bool()
@@ -64,20 +63,21 @@ def train_sparse_QK(
     n_epochs: int,
     layer,
     data,
-    head_index = 0,
-    #activation_store: ActivationsStore
-    )
+    dead_freq):
+    
     
     sparse_model = SparseQK(cfg = cfg).cuda()
     print(f"Training model with {sparse_model.d_hidden} feature pairs.")
     optimizer = t.optim.AdamW(sparse_model.parameters(), lr = 1e-3)
-    never_fired = t.zeros(cfg["d_hidden"]).cuda()
     wandb.init(project="sparse_QK_gpt2_L0.5", entity="kwyn390")
+    feature_tots = t.zeros(cfg.d_hidden)
+    tot_data = 0
     for epoch in range(n_epochs):
         batch_index = None
         progress_bar = tqdm(list(enumerate(data)))
         for batch_idx, batch in progress_bar:
             if batch_idx < 30000:
+              tot_data += (batch.size(0) * batch.size(1) * batch.size(1))
               #normalise encoder weights
               sparse_model.renorm_weights()
               optimizer.zero_grad()
@@ -87,19 +87,20 @@ def train_sparse_QK(
               resid_pre = resid_pre/ln
               q, k = cache["q", 10], cache["k", 10]
               original_scores = einops.einsum(q, k, "batch pos_q n_heads d_head, batch pos_k n_heads d_head -> batch n_heads pos_q pos_k").clone()/8
-              modified_output, reg_loss, l0, dead = sparse_model(resid_pre)
+              modified_output, reg_loss, feature_fires, dead = sparse_model(resid_pre)
               mse_loss = t.nn.MSELoss(reduction="mean")
               reconstruction_loss = mse_loss(modified_output, original_scores)
               loss = reconstruction_loss + reg_loss
               loss.backward(retain_graph = True)
               optimizer.step()
-              never_fired += dead
+              feature_tots += feature_fires.sum(0).sum(0).sum(0)
+              feature_freqs = feature_tots / tot_data
               wandb.log({
                   "recons_score": reconstruction_loss,
                   "loss": loss,
                   "reg_loss": reg_loss,
-                  "l0": l0,
-                  "never_fired": (never_fired == 0).sum()
+                  "l0": feature_fires / (feature_fires.shape(0)*(feature_fires.shape(1)**2)),
+                  "dead_features": (feature_freqs < dead_freq).sum()
 
               })
 
