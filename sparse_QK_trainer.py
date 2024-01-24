@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import math
 import torch.nn.functional as F
 import wandb
+import einops
 
 class SparseQK(nn.Module):
     def __init__(self, cfg):
