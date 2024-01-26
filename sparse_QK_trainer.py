@@ -22,9 +22,11 @@ class SparseQK(nn.Module):
         self.d_model = cfg["d_model"]
 
         self.d_hidden = d_hidden
-        self.W_enc = nn.Parameter(t.nn.init.kaiming_uniform_(t.empty(cfg["d_model"], 2, self.d_hidden)))
+        self.W_encQ = nn.Parameter(t.nn.init.kaiming_uniform_(t.empty(cfg["d_model"], self.d_hidden)))
+        self.W_encK = nn.Parameter(t.nn.init.kaiming_uniform_(t.empty(cfg["d_model"], self.d_hidden)))
         self.W_dec = nn.Parameter(t.nn.init.kaiming_uniform_(t.empty(d_hidden, self.n_heads)))
-        self.b_enc = nn.Parameter(t.zeros(2, self.d_hidden))
+        self.b_encQ = nn.Parameter(t.zeros(self.d_hidden))
+        self.b_encK = nn.Parameter(t.zeros(self.d_hidden))
         self.b_dec = nn.Parameter(t.zeros(self.n_heads))
         self.eps = cfg["eps"]
 
@@ -39,13 +41,10 @@ class SparseQK(nn.Module):
         self.to(cfg["device"])
 
     def forward(self, x, masked = False):
-        expanded_q = x.unsqueeze(2).expand(-1, -1, x.size(1), -1)
-        expanded_k = x.unsqueeze(1).expand(-1, x.size(1), -1, -1)
-        # x = [batch, posn_q, posn_k, 2, d_model]
-        x = t.stack([expanded_q, expanded_k], dim=3)
-        acts = einops.einsum(x, self.W_enc, "batch posn_q posn_k qk d_model, d_model qk d_hidden -> batch posn_q posn_k qk d_hidden") + self.b_enc
-        acts = F.relu(acts)
-        acts = pairwise_product = acts[:, :, :, 0, :] * acts[:, :, :, 1, :]
+        queries = F.relu(einops.einsum(self.W_encQ, x, "d_model d_hidden, d_model -> d_hidden") + self.b_encQ).unsqueeze(2)
+        keys= F.relu(einops.einsum(self.W_encK, x, "d_model d_hidden, d_model -> d_hidden") + self.b_encK).unsqueeze(1)
+   
+        acts = queries * keys
         reg_loss = self.reg_coeff * t.sqrt(acts.float().abs() + self.eps).sum()
         feature_fires = (acts > 0).int()
         score_reconstr = einops.einsum(acts, self.W_dec, "batch posn_q posn_k d_hidden, d_hidden n_heads -> batch posn_q posn_k n_heads")/(self.d_head ** 0.5) + self.b_dec
@@ -58,8 +57,6 @@ class SparseQK(nn.Module):
         mask = t.triu(t.ones(attn_scores.size(-2), attn_scores.size(-1), device=attn_scores.device), diagonal=1).bool()
         attn_scores.masked_fill_(mask, self.IGNORE)
         return attn_scores
-
-
 
     @t.no_grad()
     def renorm_weights(self):
@@ -75,8 +72,7 @@ def train_sparse_QK(
     n_epochs: int,
     layer,
     data):
-    
-    
+      
     sparse_model = SparseQK(cfg = cfg).cuda()
     print(f"Training model with {sparse_model.d_hidden} feature pairs.")
     optimizer = t.optim.AdamW(sparse_model.parameters(), lr = 1e-3)
