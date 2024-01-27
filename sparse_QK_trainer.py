@@ -65,13 +65,13 @@ class SparseQK(nn.Module):
         self.W_enc[:, 0, :] = self.W_enc[:, 0, :]/q_normed
         self.W_enc[:, 1, :] = self.W_enc[:, 1, :]/k_normed
 
-
 def train_sparse_QK(
     orig_model,
     cfg,
     n_epochs: int,
     layer,
-    data):
+    data,
+    scaled = 'none'):
       
     sparse_model = SparseQK(cfg = cfg).cuda()
     print(f"Training model with {sparse_model.d_hidden} feature pairs.")
@@ -95,10 +95,13 @@ def train_sparse_QK(
               q, k = cache["q", 10], cache["k", 10]
               original_scores = einops.einsum(q, k, "batch pos_q n_heads d_head, batch pos_k n_heads d_head -> batch n_heads pos_q pos_k").clone()/8
               modified_output, reg_loss, feature_fires = sparse_model(resid_pre)
-              mse_loss = t.nn.MSELoss(reduction="none")
-              abs_true = t.abs(original_scores)
-              abs_pred = t.abs(modified_output)
-              abs = t.maximum(abs_true, abs_pred)
+              mse_loss = t.MSELoss(reduction = 'none')
+              if scaled == 'none':
+                  abs = t.ones(modified_output.shape)
+              elif scaled == 'abs':
+                abs_true = t.abs(original_scores)
+                abs_pred = t.abs(modified_output)
+                abs = t.maximum(abs_true, abs_pred)
               reconstruction_loss = einops.einsum(abs_true, mse_loss(modified_output, original_scores), "batch posn_q n_heads d_head, batch posn_q n_heads d_head ->")
               reconstruction_loss = reconstruction_loss / (original_scores.size(0)*original_scores.size(1)*original_scores.size(2)**2)
               loss = reconstruction_loss + reg_loss
@@ -116,13 +119,22 @@ def train_sparse_QK(
 
               })
               del batch_idx
-
-
         print(
                 f"Epoch {epoch} reconstruction loss: {reconstruction_loss.item()} l0: {l0} reg_loss {reg_loss}"
             )
         print(f"Epoch {epoch} loss: {loss.item()}")
 
-      
-
     return sparse_model
+
+
+def get_avg_exp_score(model, data, n_heads, layer):
+    res = t.zeros(n_heads)
+    progress_bar = tqdm(list(enumerate(data)))
+    for batch_idx, batch in progress_bar:
+        _, cache = model.run_with_cache(batch["tokens"])
+        scores = t.exp(cache["attn_scores", layer]).sum(dim = 0).sum(dim = -1).sum(dim = -1)
+        res += scores
+    return res / (batch["tokens"].size(0) * (batch_idx + 1))
+        
+            
+            
