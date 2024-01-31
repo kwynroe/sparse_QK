@@ -67,7 +67,7 @@ def train_sparse_transcoder(
               ln = cache['blocks.'+str(layer)+'.ln1.hook_scale']
               resid_pre = resid_pre/ln
               original_comp = cache[comp, layer].flatten(-2)
-              reconstr_comp, l2_loss, reg_loss, feature_fires = sparse_model(resid_pre)
+              _, l2_loss, reg_loss, feature_fires = sparse_model(resid_pre, original_comp)
               loss = l2_loss + reg_loss
               loss.backward(retain_graph = True)
               optimizer.step()
