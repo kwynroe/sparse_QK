@@ -26,14 +26,41 @@ class Transcoder(nn.Module):
         self.eps = cfg["eps"]
         self.to(cfg["device"])
 
-    def forward(self, x, target):
+    def forward(self, x, target, dead_neuron_mask):
         x_cent = x - self.b_dec
-        acts = F.relu(x_cent @ self.W_enc + self.b_enc)
-        x_reconstruct = acts @ self.W_dec + self.b_dec
-        l2_loss = (x_reconstruct.float() - target.float()).pow(2).sum(-1).mean(0)
+        acts = (x_cent @ self.W_enc + self.b_enc)
+        relu_acts = F.relu(acts)
+        sae_out = relu_acts @ self.W_dec + self.b_dec
+        l2_loss = (sae_out.float() - target.float()).pow(2).sum(-1).mean(0)
         reg_loss = self.reg_coeff * t.sqrt(acts.float().abs() + self.eps).sum()
         feature_fires = (acts > 0).int()
-        return x_reconstruct, l2_loss, reg_loss, feature_fires
+        mse_loss_ghost_resid = t.tensor(0.0).cuda()
+        # gate on config and training so evals is not slowed down.
+        if self.cfg["use_ghost_grads"] and self["training"] and dead_neuron_mask.sum() > 0:
+            assert dead_neuron_mask is not None 
+            
+            # ghost protocol
+            
+            # 1.
+            residual = target - sae_out
+            l2_norm_residual = t.norm(residual, dim=-1)
+            
+            # 2.
+            feature_acts_dead_neurons_only = t.exp(acts[:, dead_neuron_mask])
+            ghost_out =  feature_acts_dead_neurons_only @ self.W_dec[dead_neuron_mask,:]
+            l2_norm_ghost_out = t.norm(ghost_out, dim = -1)
+            norm_scaling_factor = l2_norm_residual / (l2_norm_ghost_out* 2)
+            ghost_out = ghost_out*norm_scaling_factor[:, None].detach()
+            
+            # 3. 
+            mse_loss_ghost_resid = (
+                t.pow((ghost_out - residual.float()), 2) / (residual**2).sum(dim=-1, keepdim=True).sqrt()
+            )
+            mse_rescaling_factor = (l2_loss / mse_loss_ghost_resid).detach()
+            mse_loss_ghost_resid = mse_rescaling_factor * mse_loss_ghost_resid
+
+        loss = l2_loss + reg_loss + mse_loss_ghost_resid.mean()
+        return sae_out, loss, l2_loss, reg_loss, mse_loss_ghost_resid.mean(), feature_fires
 
     @t.no_grad()
     def renorm_weights(self):
@@ -54,6 +81,7 @@ def train_sparse_transcoder(
     wandb.init(project="sparse_query_transcoder", entity="kwyn390")
     feature_tots = t.zeros(cfg["d_hidden"]).cuda()
     tot_data = 0
+    dead_feature_indices = t.zeros(cfg["d_hidden"])
     for epoch in range(n_epochs):
         batch_index = None
         progress_bar = tqdm(list(enumerate(data)))
@@ -67,13 +95,14 @@ def train_sparse_transcoder(
               ln = cache['blocks.'+str(layer)+'.ln1.hook_scale']
               resid_pre = resid_pre/ln
               original_comp = cache[comp, layer].flatten(-2)
-              _, l2_loss, reg_loss, feature_fires = sparse_model(resid_pre, original_comp)
+              _, l2_loss, reg_loss, feature_fires = sparse_model(resid_pre, original_comp, dead_feature_indices)
               loss = l2_loss + reg_loss
               loss.backward(retain_graph = True)
               optimizer.step()
               feature_tots += feature_fires.sum(0).sum(0).sum(0)
               l0 = feature_fires.sum() / (feature_fires.size(0)*(feature_fires.size(1)))
               feature_freqs = feature_tots / tot_data
+              dead_feature_indices = (feature_freqs < cfg["dead_freq"])
               wandb.log({
                   "l2": l2_loss,
                   "loss": loss,
