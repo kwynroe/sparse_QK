@@ -9,7 +9,7 @@ from transformer_lens import HookedTransformer
 from transformer_lens.utils import get_act_name
 import einops
 import wandb
-from ActivationStore import ActivationsStore
+from ActivationStoreParallel import ActivationsStore
 from optimize import get_scheduler
 from sparse_transcoder import SparseTranscoder
 
@@ -108,10 +108,28 @@ def train_transcoder_on_language_model_parallel(
         pred_attn_scores_true_keys = einops.einsum(reconstr_queries, true_keys, " ... posnq n_head d_head, ... posnk n_head d_head -> ... n_head posnq posnk")/sparse_transcoder1.cfg.d_head**0.5
         pred_attn_scores_true_queries = einops.einsum(reconstr_keys, true_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/sparse_transcoder1.cfg.d_head**0.5
         full_pred_attn_scores = einops.einsum(reconstr_keys, reconstr_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/sparse_transcoder1.cfg.d_head**0.5
-        attn_score_loss_true_keys = (pred_attn_scores_true_keys - true_scores).pow(2).mean()
-        attn_score_loss_true_queries = (pred_attn_scores_true_queries - true_scores).pow(2).mean()
-        attn_scores_loss_full_pred = (full_pred_attn_scores - true_scores).pow(2).mean()
         
+        #attn_score_loss_true_keys = ((pred_attn_scores_true_keys) - (true_scores)).pow(2).mean()
+        #attn_score_loss_true_queries = ((pred_attn_scores_true_queries) - (true_scores)).pow(2).mean()
+        #attn_scores_loss_full_pred = ((full_pred_attn_scores) - (true_scores)).pow(2).mean()
+        
+        attn_score_loss_true_keys = torch.abs(torch.exp(pred_attn_scores_true_keys) - torch.exp(true_scores)).mean()
+        attn_score_loss_true_queries = torch.abs(torch.exp(pred_attn_scores_true_queries) - torch.exp(true_scores)).mean()
+        attn_scores_loss_full_pred = torch.abs(torch.exp(full_pred_attn_scores) - torch.exp(true_scores)).mean()
+        
+        
+        
+        ghost_grad_scale_Q = (attn_score_loss_true_keys / (ghost_grad_lossQ + sparse_transcoder1.eps)).detach()
+        ghost_grad_scale_K = (attn_score_loss_true_queries / (ghost_grad_lossK + sparse_transcoder1.eps)).detach()
+        
+        ghost_grad_lossQ = ghost_grad_lossQ * ghost_grad_scale_Q
+        ghost_grad_lossK = ghost_grad_lossK * ghost_grad_scale_K
+        
+        #kl_loss = torch.nn.KLDivLoss(reduction="batchmean", log_target = True)
+        true_patt = true_scores.softmax(-1)
+        full_pred_patt = attn_scores_loss_full_pred.softmax(-1)
+        #kl_div = kl_loss(true_patt, full_pred_patt).mean()
+        kl_div = (true_patt - full_pred_patt).pow(2).mean()
         #mse_lossQ + mse_lossK + 
         loss = attn_score_loss_true_keys + attn_score_loss_true_queries + reg_lossQ + reg_lossK + ghost_grad_lossQ + ghost_grad_lossK
         
@@ -161,6 +179,7 @@ def train_transcoder_on_language_model_parallel(
                         "metrics/loss_true_queries": attn_score_loss_true_queries.item(),
                         "metrics/l0_Q": l0_Q.item(),
                         "metrics/l0_K": l0_K.item(),
+                        "metrics/patt_kl": kl_div.item(),
                         #"metrics/score_var": total_variance.item(),
                         # sparsity
 
