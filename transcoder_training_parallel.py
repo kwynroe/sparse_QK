@@ -96,6 +96,7 @@ def train_transcoder_on_language_model_parallel(
             ghost_grad_neuron_mask1,
         )
         
+        
         reconstr_keys, feature_actsK, lossK, mse_lossK, reg_lossK, ghost_grad_lossK = sparse_transcoder2(
             data,
             true_keys_flatt,
@@ -109,16 +110,18 @@ def train_transcoder_on_language_model_parallel(
         pred_attn_scores_true_queries = einops.einsum(reconstr_keys, true_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/sparse_transcoder1.cfg.d_head**0.5
         full_pred_attn_scores = einops.einsum(reconstr_keys, reconstr_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/sparse_transcoder1.cfg.d_head**0.5
         
-        #attn_score_loss_true_keys = ((pred_attn_scores_true_keys) - (true_scores)).pow(2).mean()
-        #attn_score_loss_true_queries = ((pred_attn_scores_true_queries) - (true_scores)).pow(2).mean()
-        #attn_scores_loss_full_pred = ((full_pred_attn_scores) - (true_scores)).pow(2).mean()
-        
-        attn_score_loss_true_keys = torch.abs(torch.exp(pred_attn_scores_true_keys) - torch.exp(true_scores)).mean()
-        attn_score_loss_true_queries = torch.abs(torch.exp(pred_attn_scores_true_queries) - torch.exp(true_scores)).mean()
+        attn_score_loss_true_keys = ((pred_attn_scores_true_keys) - (true_scores)).pow(2).mean()
+        attn_score_loss_true_queries = ((pred_attn_scores_true_queries) - (true_scores)).pow(2).mean()
+        attn_scores_loss_full_pred = ((full_pred_attn_scores) - (true_scores)).pow(2).mean()
+        patt_true_keys = pred_attn_scores_true_keys.softmax(-1)
+        patt_true_queries = pred_attn_scores_true_queries.softmax(-1)
+        true_patt = true_scores.softmax(-1)                                   
+        #attn_score_loss_true_keys = torch.abs(torch.exp(pred_attn_scores_true_keys) - torch.exp(true_scores)).mean()
+        #attn_score_loss_true_queries = torch.abs(torch.exp(pred_attn_scores_true_queries) - torch.exp(true_scores)).mean()
         attn_scores_loss_full_pred = torch.abs(torch.exp(full_pred_attn_scores) - torch.exp(true_scores)).mean()
         
-        
-        
+        patt_loss_true_queries = (patt_true_queries - true_patt).pow(2).sum()
+        patt_loss_true_keys = (patt_true_keys - true_patt).pow(2).sum()
         ghost_grad_scale_Q = (attn_score_loss_true_keys / (ghost_grad_lossQ + sparse_transcoder1.eps)).detach()
         ghost_grad_scale_K = (attn_score_loss_true_queries / (ghost_grad_lossK + sparse_transcoder1.eps)).detach()
         
@@ -126,12 +129,17 @@ def train_transcoder_on_language_model_parallel(
         ghost_grad_lossK = ghost_grad_lossK * ghost_grad_scale_K
         
         #kl_loss = torch.nn.KLDivLoss(reduction="batchmean", log_target = True)
+        print(true_patt.shape)
         true_patt = true_scores.softmax(-1)
-        full_pred_patt = attn_scores_loss_full_pred.softmax(-1)
-        #kl_div = kl_loss(true_patt, full_pred_patt).mean()
+        full_pred_patt = full_pred_attn_scores.softmax(-1)
+        true_patt = einops.rearrange(true_patt, "batch posnq posnk -> (batch posnq) posnk")
+        full_pred_patt = einops.rearrange(full_pred_patt, "batch posnq posnk -> (batch posnq) posnk")
+        #kl_div = kl_loss(true_patt, full_pred_patt)
         kl_div = (true_patt - full_pred_patt).pow(2).mean()
+        patt_max_diff = torch.max(torch.abs((true_patt - full_pred_patt))).mean()
+        
         #mse_lossQ + mse_lossK + 
-        loss = attn_score_loss_true_keys + attn_score_loss_true_queries + reg_lossQ + reg_lossK + ghost_grad_lossQ + ghost_grad_lossK
+        loss = attn_score_loss_true_keys + attn_score_loss_true_queries + patt_loss_true_queries + patt_loss_true_keys + reg_lossQ + reg_lossK + ghost_grad_lossQ + ghost_grad_lossK
         
         did_fireQ = ((feature_actsQ > 0).float().sum(0) > 0)
         did_fireK = ((feature_actsK > 0).float().sum(0) > 0)
@@ -139,7 +147,7 @@ def train_transcoder_on_language_model_parallel(
         n_forward_passes_since_fired1 += 1
         n_forward_passes_since_fired1[did_fireQ] = 0
         n_forward_passes_since_fired2 += 1
-        n_forward_passes_since_fired1[did_fireK] = 0
+        n_forward_passes_since_fired2[did_fireK] = 0
         n_training_tokens += batch_size
 
         with torch.no_grad():
@@ -169,6 +177,8 @@ def train_transcoder_on_language_model_parallel(
                         "losses/mse_lossK": mse_lossQ.item(),
                         "losses/reg_lossQ": reg_lossQ.item(),
                         "losses/reg_lossK": reg_lossQ.item(),# normalize by reg coefficient
+                        "losses/patt_lossQ": patt_loss_true_keys.item(),
+                        "losses/patt_lossK": patt_loss_true_queries.item(),
                         "losses/ghost_grad_lossQ": ghost_grad_lossQ.item(),
                         "losses/ghost_grad_lossK": ghost_grad_lossK.item(),
                         # variance explained
@@ -183,7 +193,7 @@ def train_transcoder_on_language_model_parallel(
                         #"metrics/score_var": total_variance.item(),
                         # sparsity
 
-                        "sparsity/below_1e-6_Q": (feature_sparsity1 < 1e-6)
+                        "sparsity/below_1e-5_Q": (feature_sparsity1 < 1e-5)
                         .float()
                         .mean()
                         .item(),
@@ -195,7 +205,7 @@ def train_transcoder_on_language_model_parallel(
                         .float()
                         .mean()
                         .item(),
-                        "sparsity/below_1e-6_K": (feature_sparsity2 < 1e-6)
+                        "sparsity/below_1e-5_K": (feature_sparsity2 < 1e-5)
                         .float()
                         .mean()
                         .item(),
@@ -212,6 +222,7 @@ def train_transcoder_on_language_model_parallel(
                         "details/n_training_tokens": n_training_tokens,
                         "details/pred_key_mean": reconstr_keys.mean().item(),
                         "details/pred_query_mean": reconstr_queries.mean().item(),
+                        "details/patt_max_diff": patt_max_diff.item()
 
                     },
                     step=n_training_steps,
