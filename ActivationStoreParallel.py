@@ -240,7 +240,7 @@ class ActivationsStore:
             # pbar.update(1)
 
         new_buffer = new_buffer.reshape(-1, d_in)
-        new_buffer = new_buffer[torch.randperm(new_buffer.shape[0])]
+        #new_buffer = new_buffer[torch.randperm(new_buffer.shape[0])]
 
         return new_buffer
 
@@ -262,7 +262,7 @@ class ActivationsStore:
             [self.get_buffer(self.cfg.n_batches_in_buffer // 2), self.storage_buffer]
         )
 
-        mixing_buffer = mixing_buffer[torch.randperm(mixing_buffer.shape[0])]
+        #mixing_buffer = mixing_buffer[torch.randperm(mixing_buffer.shape[0])]
 
         # 2.  put 50 % in storage
         self.storage_buffer = mixing_buffer[: mixing_buffer.shape[0] // 2]
@@ -272,7 +272,7 @@ class ActivationsStore:
             DataLoader(
                 mixing_buffer[mixing_buffer.shape[0] // 2 :],
                 batch_size=batch_size,
-                shuffle=True,
+                shuffle=False,
             )
         )
 

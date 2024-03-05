@@ -138,11 +138,11 @@ def train_transcoder_on_language_model_parallel(
         #ghost_grad_lossK = ghost_grad_lossK * ghost_grad_scale_K
         
         #kl_loss = torch.nn.KLDivLoss(reduction="batchmean", log_target = True)
-        patt_max_diff = torch.max(torch.abs((true_patt_flat - patt_full_reconstr))).mean()
+        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr)))).mean()
         frac_accurate = (torch.argmax(patt_full_reconstr, dim = -1) == torch.argmax(true_patt_flat, dim = -1)).float().mean()
         
         #mse_lossQ + mse_lossK + 
-        loss = attn_score_loss_true_keys + attn_score_loss_true_queries + patt_loss_true_queries + patt_loss_true_keys + reg_lossQ + reg_lossK + ghost_grad_lossQ + ghost_grad_lossK
+        loss = 3*patt_loss_full_pred + patt_loss_true_queries + patt_loss_true_keys + reg_lossQ + reg_lossK + ghost_grad_lossQ + ghost_grad_lossK
         
         did_fireQ = ((feature_actsQ > 0).float().sum(0) > 0)
         did_fireK = ((feature_actsK > 0).float().sum(0) > 0)
@@ -177,9 +177,9 @@ def train_transcoder_on_language_model_parallel(
                     {
                         # losses
                         "losses/mse_lossQ": mse_lossQ.item(),
-                        "losses/mse_lossK": mse_lossQ.item(),
+                        "losses/mse_lossK": mse_lossK.item(),
                         "losses/reg_lossQ": reg_lossQ.item(),
-                        "losses/reg_lossK": reg_lossQ.item(),# normalize by reg coefficient
+                        "losses/reg_lossK": reg_lossK.item(),# normalize by reg coefficient
                         "losses/patt_lossQ": patt_loss_true_keys.item(),
                         "losses/patt_lossK": patt_loss_true_queries.item(),
                         "losses/patt_loss_full": patt_loss_full_pred.item(),

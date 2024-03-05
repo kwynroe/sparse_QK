@@ -16,7 +16,7 @@ from torch.distributions.categorical import Categorical
 from tqdm import tqdm
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 
-from geomean_initialization import compute_geometric_median
+#from geomean_initialization import compute_geometric_median
 
 
 class SparseTranscoder(HookedRootModule):
@@ -62,6 +62,7 @@ class SparseTranscoder(HookedRootModule):
             self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
 
         self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.dtype, device=self.device))
+        self.b_dec_out = nn.Parameter(torch.zeros(self.d_out, dtype=self.dtype, device=self.device))
 
         self.hook_transcoder_in = HookPoint()
         self.hook_hidden_pre = HookPoint()
@@ -91,7 +92,7 @@ class SparseTranscoder(HookedRootModule):
                 feature_acts,
                 self.W_dec,
                 "... d_hidden, d_hidden d_in -> ... d_in",
-            ) + self.b_dec
+            ) + self.b_dec_out
         
 
         # add config for whether l2 is normalized:
