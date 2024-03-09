@@ -65,6 +65,10 @@ def train_transcoder_on_language_model_parallel(
     sparse_transcoder1.train()
     sparse_transcoder2.train()
     
+    if sparse_transcoder1.cfg.attn_scores_normed:
+        attn_scores_norm = sparse_transcoder1.d_head**0.5
+    else:
+        attn_scores_norm = 1
     print("gonna progress bar!")
     pbar = tqdm(total=total_training_tokens, desc="Training SAE")
     while n_training_tokens < total_training_tokens:
@@ -85,7 +89,7 @@ def train_transcoder_on_language_model_parallel(
         
         true_queries = einops.einsum(model.W_Q[sparse_transcoder1.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_Q[sparse_transcoder1.layer]
         true_keys = einops.einsum(model.W_K[sparse_transcoder1.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_K[sparse_transcoder1.layer]
-        true_scores = einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/sparse_transcoder1.d_head**0.5
+        true_scores = einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/attn_scores_norm
 
         true_queries_flatt = einops.rearrange(true_queries, " ... n_head d_head -> ... (n_head d_head)")
         true_keys_flatt = einops.rearrange(true_keys, " ... n_head d_head -> ... (n_head d_head)")
@@ -106,9 +110,9 @@ def train_transcoder_on_language_model_parallel(
         reconstr_queries = einops.rearrange(reconstr_queries, " ... (n_head d_head) -> ... n_head d_head", n_head = 12)
         reconstr_keys = einops.rearrange(reconstr_keys, " ... (n_head d_head) -> ... n_head d_head", n_head = 12)
         
-        pred_attn_scores_true_keys = einops.einsum(reconstr_queries, true_keys, " ... posnq n_head d_head, ... posnk n_head d_head -> ... n_head posnq posnk")/sparse_transcoder1.cfg.d_head**0.5
-        pred_attn_scores_true_queries = einops.einsum(reconstr_keys, true_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/sparse_transcoder1.cfg.d_head**0.5
-        full_pred_attn_scores = einops.einsum(reconstr_keys, reconstr_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/sparse_transcoder1.cfg.d_head**0.5
+        pred_attn_scores_true_keys = einops.einsum(reconstr_queries, true_keys, " ... posnq n_head d_head, ... posnk n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
+        pred_attn_scores_true_queries = einops.einsum(reconstr_keys, true_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
+        full_pred_attn_scores = einops.einsum(reconstr_keys, reconstr_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
         
         attn_score_loss_true_keys = ((pred_attn_scores_true_keys) - (true_scores)).pow(2).mean()
         attn_score_loss_true_queries = ((pred_attn_scores_true_queries) - (true_scores)).pow(2).mean()
