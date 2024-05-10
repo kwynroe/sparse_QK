@@ -86,7 +86,7 @@ def train_transcoder_on_language_model_parallel(
         ghost_grad_neuron_mask1 = (n_forward_passes_since_fired1 > sparse_transcoder1.cfg.dead_feature_window).bool()
         ghost_grad_neuron_mask2 = (n_forward_passes_since_fired2 > sparse_transcoder2.cfg.dead_feature_window).bool()
         data = activation_store.next_batch()
-        
+        data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)
         true_queries = einops.einsum(model.W_Q[sparse_transcoder1.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_Q[sparse_transcoder1.layer]
         true_keys = einops.einsum(model.W_K[sparse_transcoder1.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_K[sparse_transcoder1.layer]
         true_scores = einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/attn_scores_norm
@@ -148,8 +148,8 @@ def train_transcoder_on_language_model_parallel(
         #mse_lossQ + mse_lossK + 
         loss = 3*patt_loss_full_pred + patt_loss_true_queries + patt_loss_true_keys + reg_lossQ + reg_lossK + ghost_grad_lossQ + ghost_grad_lossK
         
-        did_fireQ = ((feature_actsQ > 0).float().sum(0) > 0)
-        did_fireK = ((feature_actsK > 0).float().sum(0) > 0)
+        did_fireQ = ((feature_actsQ > 0).float().sum(0).sum(0) > 0)
+        did_fireK = ((feature_actsK > 0).float().sum(0).sum(0) > 0)
         
         n_forward_passes_since_fired1 += 1
         n_forward_passes_since_fired1[did_fireQ] = 0
@@ -159,8 +159,8 @@ def train_transcoder_on_language_model_parallel(
 
         with torch.no_grad():
             # Calculate the sparsities, and add it to a list, calculate sparsity metrics
-            act_freq_scores1 += (feature_actsQ.abs() > 0).float().sum(0)
-            act_freq_scores2 += (feature_actsK.abs() > 0).float().sum(0)
+            act_freq_scores1 += (feature_actsQ.abs() > 0).float().sum(0).sum(0)
+            act_freq_scores2 += (feature_actsK.abs() > 0).float().sum(0).sum(0)
             n_frac_active_tokens += batch_size
             feature_sparsity1 = act_freq_scores1 / n_frac_active_tokens
             feature_sparsity2 = act_freq_scores2 / n_frac_active_tokens
@@ -214,11 +214,11 @@ def train_transcoder_on_language_model_parallel(
                         .float()
                         .mean()
                         .item(),
-                        "sparsity/avg_log_freq_K": (torch.log(feature_sparsity2).mean())
+                        "sparsity/avg_log_freq_K": (torch.log10(feature_sparsity2).mean())
                         .float()
                         .mean()
                         .item(),
-                        "sparsity/avg_log_freq_Q": (torch.log(feature_sparsity1).mean())
+                        "sparsity/avg_log_freq_Q": (torch.log10(feature_sparsity1).mean())
                         .float()
                         .mean()
                         .item(),
@@ -228,7 +228,8 @@ def train_transcoder_on_language_model_parallel(
                         "details/pred_key_mean": reconstr_keys.mean().item(),
                         "details/pred_query_mean": reconstr_queries.mean().item(),
                         "details/patt_max_diff": patt_max_diff.item(),
-                        "details/frac_acc": frac_accurate.item()
+                        "details/frac_acc": frac_accurate.item(),
+                        "details/lr": current_learning_rate
 
                     },
                     step=n_training_steps,

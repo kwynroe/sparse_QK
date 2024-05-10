@@ -20,7 +20,7 @@ def language_model_transcoder_runner_parallel(cfg1, cfg2):
     activations_loader = ActivationsStore(cfg1, model)
 
     if cfg1.log_to_wandb:
-        wandb.init(project=cfg1.wandb_project, config=cfg1, name=cfg1.run_name)
+        wandb.init(entity = cfg1.entity, project=cfg1.wandb_project, config=cfg1, name=cfg1.run_name)
 
     # train SAE
     sparse_transcoder1, sparse_transcoder2 = train_transcoder_on_language_model_parallel(
