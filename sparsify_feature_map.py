@@ -31,9 +31,7 @@ def train_transcoder_on_language_model_parallel(
     n_training_tokens = 0
     n_resampled_neurons = 0
     steps_before_reset = 0
-    if n_checkpoints > 0:
-        checkpoint_thresholds = list(range(0, total_training_tokens, total_training_tokens // n_checkpoints))[1:]
-    
+
     # track active features
 
     mask = nn.Parameter(torch.ones(query_transcoder.d_hidden, key_transcoder.d_hidden, query_transcoder.n_heads))
@@ -71,6 +69,7 @@ def train_transcoder_on_language_model_parallel(
         q_features = einops.rearrange(query_transcoder.W_dec, "d_hidden (n_head d_head) -> d_hidden n_head d_head", d_head = query_transcoder.d_head)
         k_features = einops.rearrange(key_transcoder.W_dec, "d_hidden (n_head d_head) -> d_hidden n_head d_head", d_head = key_transcoder.d_head)
         feature_map = einops.einsum(q_features, k_features, "d_hidden_Q n_head d_head, d_hidden_K n_head d_head -> d_hidden_Q d_hidden_K n_head")
+        feature_map = feature_map * mask
         bias_acts = einops.einsum(k_features, query_transcoder.b_dec, "d_hidden_K n_head d_head, n_head d_head -> n_head d_hidden_K")
 
         feature_acts_Q = F.relu(einops.einsum((true_queries_flat - query_transcoder.b_dec), query_transcoder.W_enc, "... d_model, d_model d_hidden -> ... d_hidden") + query_transcoder.b_enc)
