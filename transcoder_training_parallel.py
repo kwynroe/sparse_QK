@@ -13,7 +13,14 @@ from ActivationStoreParallel import ActivationsStore
 from optimize import get_scheduler
 from sparse_transcoder import SparseTranscoder
 
+def apply_causal_mask(attn_scores):
 
+        mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)).cuda(), diagonal=1).bool()
+        # Apply the mask to attention scores, then return the masked scores
+        attn_scores.masked_fill_(mask, -1e9)
+        return attn_scores
+    
+    
 def train_transcoder_on_language_model_parallel(
     cfg,
     model: HookedTransformer,
@@ -89,7 +96,7 @@ def train_transcoder_on_language_model_parallel(
         data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)
         true_queries = einops.einsum(model.W_Q[sparse_transcoder1.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_Q[sparse_transcoder1.layer]
         true_keys = einops.einsum(model.W_K[sparse_transcoder1.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_K[sparse_transcoder1.layer]
-        true_scores = einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/attn_scores_norm
+        true_scores = apply_causal_mask(einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/attn_scores_norm)
 
         true_queries_flatt = einops.rearrange(true_queries, " ... n_head d_head -> ... (n_head d_head)")
         true_keys_flatt = einops.rearrange(true_keys, " ... n_head d_head -> ... (n_head d_head)")
@@ -110,9 +117,9 @@ def train_transcoder_on_language_model_parallel(
         reconstr_queries = einops.rearrange(reconstr_queries, " ... (n_head d_head) -> ... n_head d_head", n_head = 12)
         reconstr_keys = einops.rearrange(reconstr_keys, " ... (n_head d_head) -> ... n_head d_head", n_head = 12)
         
-        pred_attn_scores_true_keys = einops.einsum(reconstr_queries, true_keys, " ... posnq n_head d_head, ... posnk n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
-        pred_attn_scores_true_queries = einops.einsum(reconstr_keys, true_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
-        full_pred_attn_scores = einops.einsum(reconstr_keys, reconstr_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
+        pred_attn_scores_true_keys = apply_causal_mask(einops.einsum(reconstr_queries, true_keys, " ... posnq n_head d_head, ... posnk n_head d_head -> ... n_head posnq posnk")/attn_scores_norm)
+        pred_attn_scores_true_queries = apply_causal_mask(einops.einsum(reconstr_keys, true_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm)
+        full_pred_attn_scores = apply_causal_mask(einops.einsum(reconstr_keys, reconstr_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm)
         
         attn_score_loss_true_keys = ((pred_attn_scores_true_keys) - (true_scores)).pow(2).mean()
         attn_score_loss_true_queries = ((pred_attn_scores_true_queries) - (true_scores)).pow(2).mean()
@@ -142,7 +149,7 @@ def train_transcoder_on_language_model_parallel(
         #ghost_grad_lossK = ghost_grad_lossK * ghost_grad_scale_K
         
         #kl_loss = torch.nn.KLDivLoss(reduction="batchmean", log_target = True)
-        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr)))).mean()
+        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr))), dim = -1).values.mean()
         frac_accurate = (torch.argmax(patt_full_reconstr, dim = -1) == torch.argmax(true_patt_flat, dim = -1)).float().mean()
         
         #mse_lossQ + mse_lossK + 

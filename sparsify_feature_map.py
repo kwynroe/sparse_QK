@@ -16,7 +16,14 @@ from sparse_transcoder import SparseTranscoder
 import torch.nn.functional as F
 
 
-def train_transcoder_on_language_model_parallel(
+def apply_causal_mask(attn_scores):
+
+        mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)).cuda(), diagonal=1).bool()
+        # Apply the mask to attention scores, then return the masked scores
+        attn_scores.masked_fill_(mask, -1e9)
+        return attn_scores
+
+def train_mask(
     cfg,
     model,
     query_transcoder,
@@ -34,8 +41,8 @@ def train_transcoder_on_language_model_parallel(
 
     # track active features
 
-    mask = nn.Parameter(torch.ones(query_transcoder.d_hidden, key_transcoder.d_hidden, query_transcoder.n_heads))
-    optimizer = Adam(mask.parameters(), lr = cfg.lr)
+    mask = nn.Parameter(torch.ones(query_transcoder.d_hidden, key_transcoder.d_hidden, cfg.n_heads).cuda())
+    optimizer = Adam([mask], lr = cfg.lr)
     
     print("gonna schedule!")
     scheduler = get_scheduler(
@@ -50,10 +57,11 @@ def train_transcoder_on_language_model_parallel(
         attn_scores_norm = query_transcoder.d_head**0.5
     else:
         attn_scores_norm = 1
-        
+    
+    wandb.init(entity = "kwyn390", project="mask_trainer", config=cfg, name=cfg.run_name)
     pbar = tqdm(total=total_training_tokens, desc="Training SAE")
     while n_training_tokens < total_training_tokens:
-        mask = torch.clip(mask, min = 0, max = 1)
+        
         scheduler.step()
         optimizer.zero_grad()
         
@@ -61,45 +69,59 @@ def train_transcoder_on_language_model_parallel(
         data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)
         true_queries = einops.einsum(model.W_Q[query_transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_Q[query_transcoder.layer]
         true_keys = einops.einsum(model.W_K[query_transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_K[query_transcoder.layer]
-        true_queries_flat = einops.rearrange(true_queries, " ... n_head d_head -> ... (n_head d_head)")
-        true_keys_flat = einops.rearrange(true_keys, " ... n_head d_head -> ... (n_head d_head)")
         true_scores = einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/attn_scores_norm
+        true_scores = apply_causal_mask(true_scores)
         true_patt = true_scores.log_softmax(-1)
         
         q_features = einops.rearrange(query_transcoder.W_dec, "d_hidden (n_head d_head) -> d_hidden n_head d_head", d_head = query_transcoder.d_head)
         k_features = einops.rearrange(key_transcoder.W_dec, "d_hidden (n_head d_head) -> d_hidden n_head d_head", d_head = key_transcoder.d_head)
         feature_map = einops.einsum(q_features, k_features, "d_hidden_Q n_head d_head, d_hidden_K n_head d_head -> d_hidden_Q d_hidden_K n_head")
         feature_map = feature_map * mask
-        bias_acts = einops.einsum(k_features, query_transcoder.b_dec, "d_hidden_K n_head d_head, n_head d_head -> n_head d_hidden_K")
+        bias_reshape = einops.rearrange(query_transcoder.b_dec_out, "(n_head d_head) -> n_head d_head", n_head = 12)
+        bias_acts = einops.einsum(k_features, bias_reshape, "d_hidden_K n_head d_head, n_head d_head -> n_head d_hidden_K")
 
-        feature_acts_Q = F.relu(einops.einsum((true_queries_flat - query_transcoder.b_dec), query_transcoder.W_enc, "... d_model, d_model d_hidden -> ... d_hidden") + query_transcoder.b_enc)
-        feature_acts_K = F.relu(einops.einsum((true_keys_flat - key_transcoder.b_dec), key_transcoder.W_enc, "... d_model, d_model d_hidden -> ... d_hidden") + key_transcoder.b_enc)
+        feature_acts_Q = F.relu(einops.einsum((data - query_transcoder.b_dec), query_transcoder.W_enc, "... d_model, d_model d_hidden -> ... d_hidden") + query_transcoder.b_enc)
+        feature_acts_K = F.relu(einops.einsum((data - key_transcoder.b_dec), key_transcoder.W_enc, "... d_model, d_model d_hidden -> ... d_hidden") + key_transcoder.b_enc)
 
         #given feature acts and map between features, compute attention contribution
         
-        attn_contribution = einops.einsum(feature_acts_Q, feature_map, "... d_hidden Q, d_hidden_Q d_hidden_K n_head -> ... d_hidden_K n_head")
-        attn_contribution = einops.einsum(attn_contribution, feature_acts_K, "... d_hidden_K n_head, ... d_hidden_K -> ... n_head")
-        contr_from_bias = einops.einsum(bias_acts, feature_acts_K, "n_head d_hidden_K, ... d_hidden_K -> ... n_head")
-        attn_scores_reconstr = attn_contribution + contr_from_bias
+        attn_contribution = einops.einsum(feature_acts_Q, feature_map, "... d_hidden_Q, d_hidden_Q d_hidden_K n_head -> ... d_hidden_K n_head")
+        #torch.Size([16, 3600, 12]) torch.Size([16, 256, 3600])
+        attn_contribution = einops.einsum(attn_contribution, feature_acts_K, "batch posnQ d_hidden_K n_head, batch posnK d_hidden_K -> batch n_head posnQ posnK")
+        contr_from_bias = einops.einsum(bias_acts, feature_acts_K, "n_head d_hidden_K, batch posnK d_hidden_K -> batch n_head posnK")
+        contr_from_bias = contr_from_bias.unsqueeze(2)
+        #print(attn_contribution.shape, contr_from_bias.shape)
+        attn_scores_reconstr = (attn_contribution + contr_from_bias)/attn_scores_norm
+        attn_scores_reconstr = apply_causal_mask(attn_scores_reconstr)
         
         reconstr_patt = attn_scores_reconstr.log_softmax(-1)
         true_patt_flat = true_patt.view((-1, true_patt.shape[-1]))
         reconstr_patt = reconstr_patt.view((-1, reconstr_patt.shape[-1]))
         kl = torch.nn.KLDivLoss(reduction = "batchmean", log_target = True)
+        #print(reconstr_patt.shape, true_patt_flat.shape)
         kl_div = kl(reconstr_patt, true_patt_flat)
         reg_loss = cfg.reg_coefficient * torch.sqrt(mask.float().abs() + cfg.eps).sum()
-        loss = kl_div + reg_loss
+        loss = 1000*kl_div + reg_loss
         
         n_training_tokens += batch_size
 
         with torch.no_grad():
-            frac_zeros = (mask == 0).mean()
+            frac_zeros = (mask == 0).float().mean()
+            frac_small = (mask < 0.05).float().mean()
+            frac_decreasing = (mask < 0.95).float().mean()
+            nonzeros = (feature_map > 0)
+            zero_rows = nonzeros.sum(-1).sum(-1)
+            zero_rows = (zero_rows > 0).sum()
             wandb.log(
                     {
                         # losses
                         "losses/kl_div": kl_div.item(),
+                        "losses/reg_loss": reg_loss.item(),
+                        "losses/zero_rows": zero_rows.item(),
                         # variance explained
                         "metrics/frac_zeros" : frac_zeros.item(),
+                        "metrics/frac_small" : frac_small.item(),
+                        "metrics/frac_decreaasing" : frac_decreasing.item(),
 
                     },
                     step=n_training_steps,
@@ -120,6 +142,8 @@ def train_transcoder_on_language_model_parallel(
         #sparse_transcoder1.remove_gradient_parallel_to_decoder_directions()
         #sparse_transcoder2.remove_gradient_parallel_to_decoder_directions()
         optimizer.step()
+        
+        mask.data.clamp_(0, 1)
 
 
         """# checkpoint if at checkpoint frequency

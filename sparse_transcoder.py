@@ -59,7 +59,7 @@ class SparseTranscoder(HookedRootModule):
 
         with torch.no_grad():
             # Anthropic normalize this to have unit columns
-            self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
+            self.W_enc.data /= torch.norm(self.W_enc.data, dim=1, keepdim=True)
 
         self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.dtype, device=self.device))
         self.b_dec_out = nn.Parameter(torch.zeros(self.d_out, dtype=self.dtype, device=self.device))
