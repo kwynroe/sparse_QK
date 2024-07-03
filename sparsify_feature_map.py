@@ -15,7 +15,12 @@ from optimize import get_scheduler
 from sparse_transcoder import SparseTranscoder
 import torch.nn.functional as F
 
-
+def apply_causal_mask(attn_scores):
+        mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)).cuda(), diagonal=1).bool()
+        # Apply the mask to attention scores, then return the masked scores
+        attn_scores.masked_fill_(mask, 1e-9)
+        return attn_scores
+    
 def train_transcoder_on_language_model_parallel(
     cfg,
     model,
@@ -69,7 +74,7 @@ def train_transcoder_on_language_model_parallel(
         true_queries_flat = einops.rearrange(true_queries, " ... n_head d_head -> ... (n_head d_head)")
         true_keys_flat = einops.rearrange(true_keys, " ... n_head d_head -> ... (n_head d_head)")
         true_scores = einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/attn_scores_norm
-        true_patt = true_scores.log_softmax(-1)
+        true_patt = apply_causal_mask(true_scores).log_softmax(-1)
         
         #mask feature-map
         feature_map = feature_map * mask
@@ -88,7 +93,7 @@ def train_transcoder_on_language_model_parallel(
         
         #pattern and loss
         attn_scores_reconstr = attn_contribution + contr_from_bias
-        reconstr_patt = attn_scores_reconstr.log_softmax(-1)
+        reconstr_patt = apply_causal_mask(attn_scores_reconstr).log_softmax(-1)
         true_patt_flat = true_patt.view((-1, true_patt.shape[-1]))
         reconstr_patt = reconstr_patt.view((-1, reconstr_patt.shape[-1]))
         kl = torch.nn.KLDivLoss(reduction = "batchmean", log_target = True)

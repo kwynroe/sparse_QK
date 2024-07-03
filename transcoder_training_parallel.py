@@ -13,6 +13,12 @@ from ActivationStoreParallel import ActivationsStore
 from optimize import get_scheduler
 from sparse_transcoder import SparseTranscoder
 
+def apply_causal_mask(attn_scores):
+        mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)).cuda(), diagonal=1).bool()
+        # Apply the mask to attention scores, then return the masked scores
+        attn_scores.masked_fill_(mask, 1e-9)
+        return attn_scores
+
 
 def train_transcoder_on_language_model_parallel(
     cfg,
@@ -86,7 +92,7 @@ def train_transcoder_on_language_model_parallel(
         true_queries = einops.einsum(model.W_Q[query_transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_Q[query_transcoder.layer]
         true_keys = einops.einsum(model.W_K[query_transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_K[query_transcoder.layer]
         true_scores = einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/attn_scores_norm
-        true_patt = true_scores.log_softmax(-1)
+        true_patt = apply_causal_mask(true_scores).log_softmax(-1)
         
         true_queries_flatt = einops.rearrange(true_queries, " ... n_head d_head -> ... (n_head d_head)")
         true_keys_flatt = einops.rearrange(true_keys, " ... n_head d_head -> ... (n_head d_head)")
@@ -117,9 +123,9 @@ def train_transcoder_on_language_model_parallel(
         attn_score_loss_true_keys = ((pred_attn_scores_true_keys) - (true_scores)).pow(2).mean()
         attn_score_loss_true_queries = ((pred_attn_scores_true_queries) - (true_scores)).pow(2).mean()
         attn_scores_loss_full_pred = ((full_pred_attn_scores) - (true_scores)).pow(2).mean()
-        patt_true_keys = pred_attn_scores_true_keys.log_softmax(-1)
-        patt_true_queries = pred_attn_scores_true_queries.log_softmax(-1)
-        patt_full_reconstr = full_pred_attn_scores.log_softmax(-1)                              
+        patt_true_keys = apply_causal_mask(pred_attn_scores_true_keys).log_softmax(-1)
+        patt_true_queries = apply_causal_mask(pred_attn_scores_true_queries).log_softmax(-1)
+        patt_full_reconstr = apply_causal_mask(full_pred_attn_scores).log_softmax(-1)                              
 
         #Reshape patterns and compute KL-Divergences for loss
         kl_loss = torch.nn.KLDivLoss(reduction="batchmean", log_target = True)
