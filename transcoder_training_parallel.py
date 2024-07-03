@@ -174,64 +174,65 @@ def train_transcoder_on_language_model_parallel(
             explained_var_q = 1 - resid_var_q / total_variance
             explained_var_k = 1 - resid_var_k / total_variance
             
-                
-            wandb.log(
-                    {
-                        # losses
-                        "losses/mse_lossQ": mse_lossQ.item(),
-                        "losses/mse_lossK": mse_lossK.item(),
-                        "losses/reg_lossQ": reg_lossQ.item(),
-                        "losses/reg_lossK": reg_lossK.item(),# normalize by reg coefficient
-                        "losses/patt_lossQ": patt_loss_true_keys.item(),
-                        "losses/patt_lossK": patt_loss_true_queries.item(),
-                        "losses/patt_loss_full": patt_loss_full_pred.item(),
-                        # variance explained
-                        "metrics/var_explained_Q" : explained_var_q.item(),
-                        "metrics/var_explained_K" : explained_var_k.item(),
-                        "metrics/full_pred_diff": attn_scores_loss_full_pred.item(),
-                        "metrics/loss_true_keys": attn_score_loss_true_keys.item(),
-                        "metrics/loss_true_queries": attn_score_loss_true_queries.item(),
-                        "metrics/l0_Q": l0_Q.item(),
-                        "metrics/l0_K": l0_K.item(),
-                        #"metrics/score_var": total_variance.item(),
-                        # sparsity
+            if use_wandb:
+                if (n_training_steps + 1) % wandb_log_frequency == 0:
+                    wandb.log(
+                            {
+                                # losses
+                                "losses/mse_lossQ": mse_lossQ.item(),
+                                "losses/mse_lossK": mse_lossK.item(),
+                                "losses/reg_lossQ": reg_lossQ.item(),
+                                "losses/reg_lossK": reg_lossK.item(),# normalize by reg coefficient
+                                "losses/patt_lossQ": patt_loss_true_keys.item(),
+                                "losses/patt_lossK": patt_loss_true_queries.item(),
+                                "losses/patt_loss_full": patt_loss_full_pred.item(),
+                                # variance explained
+                                "metrics/var_explained_Q" : explained_var_q.item(),
+                                "metrics/var_explained_K" : explained_var_k.item(),
+                                "metrics/full_pred_diff": attn_scores_loss_full_pred.item(),
+                                "metrics/loss_true_keys": attn_score_loss_true_keys.item(),
+                                "metrics/loss_true_queries": attn_score_loss_true_queries.item(),
+                                "metrics/l0_Q": l0_Q.item(),
+                                "metrics/l0_K": l0_K.item(),
+                                #"metrics/score_var": total_variance.item(),
+                                # sparsity
 
-                        "sparsity/below_1e-5_Q": (feature_sparsity1 < 1e-5)
-                        .float()
-                        .mean()
-                        .item(),
-                        "sparsity/above_1e-1_K": (feature_sparsity1 > 1e-1)
-                        .float()
-                        .mean()
-                        .item(),
-                        "sparsity/above_1e-1_Q": (feature_sparsity2 > 1e-1)
-                        .float()
-                        .mean()
-                        .item(),
-                        "sparsity/below_1e-5_K": (feature_sparsity2 < 1e-5)
-                        .float()
-                        .mean()
-                        .item(),
-                        "sparsity/avg_log_freq_K": (torch.log10(feature_sparsity2).mean())
-                        .float()
-                        .mean()
-                        .item(),
-                        "sparsity/avg_log_freq_Q": (torch.log10(feature_sparsity1).mean())
-                        .float()
-                        .mean()
-                        .item(),
-                        
+                                "sparsity/below_1e-5_Q": (feature_sparsity1 < 1e-5)
+                                .float()
+                                .mean()
+                                .item(),
+                                "sparsity/above_1e-1_K": (feature_sparsity1 > 1e-1)
+                                .float()
+                                .mean()
+                                .item(),
+                                "sparsity/above_1e-1_Q": (feature_sparsity2 > 1e-1)
+                                .float()
+                                .mean()
+                                .item(),
+                                "sparsity/below_1e-5_K": (feature_sparsity2 < 1e-5)
+                                .float()
+                                .mean()
+                                .item(),
+                                "sparsity/avg_log_freq_K": (torch.log10(feature_sparsity2).mean())
+                                .float()
+                                .mean()
+                                .item(),
+                                "sparsity/avg_log_freq_Q": (torch.log10(feature_sparsity1).mean())
+                                .float()
+                                .mean()
+                                .item(),
+                                
 
-                        "details/n_training_tokens": n_training_tokens,
-                        "details/pred_key_mean": reconstr_keys.mean().item(),
-                        "details/pred_query_mean": reconstr_queries.mean().item(),
-                        "details/patt_max_diff": patt_max_diff.item(),
-                        "details/frac_acc": frac_accurate.item(),
-                        "details/lr": current_learning_rate
+                                "details/n_training_tokens": n_training_tokens,
+                                "details/pred_key_mean": reconstr_keys.mean().item(),
+                                "details/pred_query_mean": reconstr_queries.mean().item(),
+                                "details/patt_max_diff": patt_max_diff.item(),
+                                "details/frac_acc": frac_accurate.item(),
+                                "details/lr": current_learning_rate
 
-                    },
-                    step=n_training_steps,
-                )
+                            },
+                            step=n_training_steps,
+                    )
 
             # record loss frequently, but not all the time.
             """if use_wandb and ((n_training_steps + 1) % (wandb_log_frequency * 10) == 0):
@@ -292,199 +293,3 @@ def train_transcoder_on_language_model_parallel(
 
     return query_transcoder, key_transcoder
 
-
-@torch.no_grad()
-def run_evals(sparse_autoencoder: SparseTranscoder, activation_store: ActivationsStore, model: HookedTransformer, n_training_steps: int):
-    
-    hook_point = sparse_autoencoder.cfg.hook_point
-    hook_point_layer = sparse_autoencoder.cfg.hook_point_layer
-    hook_point_head_index = sparse_autoencoder.cfg.hook_point_head_index
-    
-     ### Evals
-    eval_tokens = activation_store.get_batch_tokens()
-    
-    # Get Reconstruction Score
-    recons_score, ntp_loss, recons_loss, zero_abl_loss = get_recons_loss(sparse_autoencoder, model, activation_store, eval_tokens)
-    
-    # get cache
-    _, cache = model.run_with_cache(eval_tokens, prepend_bos=False, names_filter=[get_act_name("pattern", hook_point_layer), hook_point])
-    
-    # get act
-    if sparse_autoencoder.cfg.hook_point_head_index is not None:
-        original_act = cache[sparse_autoencoder.cfg.hook_point][:,:,sparse_autoencoder.cfg.hook_point_head_index]
-    else:
-        original_act = cache[sparse_autoencoder.cfg.hook_point]
-        
-    transcoder_out, feature_acts, _, _, _, _ = sparse_autoencoder(
-        original_act
-    )
-    patterns_original = cache[get_act_name("pattern", hook_point_layer)][:,hook_point_head_index].detach().cpu()
-    del cache
-    
-    if "cuda" in str(model.cfg.device):
-        torch.cuda.empty_cache()
-    
-    l2_norm_in = torch.norm(original_act, dim=-1)
-    l2_norm_out = torch.norm(transcoder_out, dim=-1)
-    l2_norm_ratio = l2_norm_out / l2_norm_in
-    
-    wandb.log(
-        {
-
-            # l2 norms
-            "metrics/l2_norm": l2_norm_out.mean().item(),
-            "metrics/l2_ratio": l2_norm_ratio.mean().item(),
-            
-            # CE Loss
-            "metrics/CE_loss_score": recons_score,
-            "metrics/ce_loss_without_sae": ntp_loss,
-            "metrics/ce_loss_with_sae": recons_loss,
-            "metrics/ce_loss_with_ablation": zero_abl_loss,
-            
-        },
-        step=n_training_steps,
-    )
-    
-    head_index = sparse_autoencoder.cfg.hook_point_head_index
-
-    def standard_replacement_hook(activations, hook):
-        activations = sparse_autoencoder.forward(activations)[0].to(activations.dtype)
-        return activations
-
-    def head_replacement_hook(activations, hook):
-        new_actions = sparse_autoencoder.forward(activations[:,:,head_index])[0].to(activations.dtype)
-        activations[:,:,head_index] = new_actions
-        return activations
-
-    head_index = sparse_autoencoder.cfg.hook_point_head_index
-    replacement_hook = standard_replacement_hook if head_index is None else head_replacement_hook
-    
-    # get attn when using reconstructed activations
-    with model.hooks(fwd_hooks=[(hook_point, partial(replacement_hook))]):
-        _, new_cache = model.run_with_cache(eval_tokens, names_filter=[get_act_name("pattern", hook_point_layer)])
-        patterns_reconstructed = new_cache[get_act_name("pattern", hook_point_layer)][:,hook_point_head_index].detach().cpu()
-        del new_cache
-        
-    # get attn when using reconstructed activations
-    with model.hooks(fwd_hooks=[(hook_point, partial(zero_ablate_hook))]):
-        _, zero_ablation_cache = model.run_with_cache(eval_tokens, names_filter=[get_act_name("pattern", hook_point_layer)])
-        patterns_ablation = zero_ablation_cache[get_act_name("pattern", hook_point_layer)][:,hook_point_head_index].detach().cpu()
-        del zero_ablation_cache
-        
-        
-    # Visualizations to show L0 / MSE distributions
-    # l0 = (feature_acts > 0).float().sum(-1)
-    # per_token_l2_loss = (sae_out - original_act).pow(2).sum(dim=-1).squeeze()
-    
-    # fig = px.scatter(
-    #     x = per_token_l2_loss.flatten().cpu().numpy(),
-    #     y = l0.flatten().cpu().numpy(),
-    #     color = np.arange(per_token_l2_loss.shape[1]).repeat(per_token_l2_loss.shape[0]),
-    #     opacity=0.5,
-    #     labels = {"color": "position", "x": "MSE Loss", "y": "L0"},
-    #     title = "L0 vs MSE Loss",
-    #     marginal_x="histogram",
-    #     marginal_y="histogram",
-    # )
-    # wandb.log({"plots/l0_vs_mse_loss": wandb.Plotly(fig)}, step = n_training_steps)
-    
-    # fig = px.scatter(
-    #     x =  per_token_l2_loss.flatten().cpu().numpy(),
-    #     y = l2_norm_in.flatten().cpu().numpy(),
-    #     color = np.arange(per_token_l2_loss.shape[1]).repeat(per_token_l2_loss.shape[0]),
-    #     opacity=0.5,
-    #     labels={"color": "position", "x": "MSE Loss", "y": "L2 Norm"},
-    #     title = "L2 Norm vs MSE Loss",
-    #     marginal_x="histogram",
-    #     marginal_y="histogram",
-    # )
-    # wandb.log({"plots/l2_norm_vs_mse_loss": wandb.Plotly(fig)}, step = n_training_steps)
-
-    # if dealing with a head SAE, do the head metrics.
-    if sparse_autoencoder.cfg.hook_point_head_index:
-        
-        # show patterns before/after
-        # fig_patterns_original = px.imshow(patterns_original[0].numpy(), title="original attn scores",
-        #     color_continuous_midpoint=0, color_continuous_scale="RdBu")
-        # fig_patterns_original.update_layout(coloraxis_showscale=False)         # hide colorbar 
-        # wandb.log({"attention/patterns_original": wandb.Plotly(fig_patterns_original)}, step = n_training_steps)
-        # fig_patterns_reconstructed = px.imshow(patterns_reconstructed[0].numpy(), title="reconstructed attn scores",
-        #         color_continuous_midpoint=0, color_continuous_scale="RdBu")
-        # fig_patterns_reconstructed.update_layout(coloraxis_showscale=False)         # hide colorbar
-        # wandb.log({"attention/patterns_reconstructed": wandb.Plotly(fig_patterns_reconstructed)}, step = n_training_steps)
-        
-        kl_result_reconstructed = kl_divergence_attention(patterns_original, patterns_reconstructed)
-        kl_result_reconstructed = kl_result_reconstructed.sum(dim=-1).numpy()
-        # print(kl_result.mean().item())
-        # px.imshow(kl_result, title="KL Divergence", width=800, height=800,
-        #       color_continuous_midpoint=0, color_continuous_scale="RdBu").show()
-        # px.histogram(kl_result.flatten()).show()
-        # px.line(kl_result.mean(0), title="KL Divergence by Position").show()
-        
-        kl_result_ablation = kl_divergence_attention(patterns_original, patterns_ablation)
-        kl_result_ablation = kl_result_ablation.sum(dim=-1).numpy()
-        # print(kl_result.mean().item())
-        # # px.imshow(kl_result, title="KL Divergence", width=800, height=800,
-        # #       color_continuous_midpoint=0, color_continuous_scale="RdBu").show()
-        # px.histogram(kl_result.flatten()).show()
-        # px.line(kl_result.mean(0), title="KL Divergence by Position").show()
-    
-        wandb.log(
-            {
-
-              "metrics/kldiv_reconstructed": kl_result_reconstructed.mean().item(),
-              "metrics/kldiv_ablation": kl_result_ablation.mean().item(),
-                
-            },
-            step=n_training_steps,
-        )
-
-@torch.no_grad()
-def get_recons_loss(sparse_autoencoder, model, activation_store, batch_tokens):
-    hook_point = activation_store.cfg.hook_point
-    loss = model(batch_tokens, return_type="loss")
-
-    head_index = sparse_autoencoder.cfg.hook_point_head_index
-
-    def standard_replacement_hook(activations, hook):
-        activations = sparse_autoencoder.forward(activations)[0].to(activations.dtype)
-        return activations
-
-    def head_replacement_hook(activations, hook):
-        new_actions = sparse_autoencoder.forward(activations[:,:,head_index])[0].to(activations.dtype)
-        activations[:,:,head_index] = new_actions
-        return activations
-
-    replacement_hook = standard_replacement_hook if head_index is None else head_replacement_hook
-    recons_loss = model.run_with_hooks(
-        batch_tokens,
-        return_type="loss",
-        fwd_hooks=[(hook_point, partial(replacement_hook))],
-    )
-
-    zero_abl_loss = model.run_with_hooks(
-        batch_tokens, return_type="loss", fwd_hooks=[(hook_point, zero_ablate_hook)]
-    )
-
-    score = (zero_abl_loss - recons_loss) / (zero_abl_loss - loss)
-
-    return score, loss, recons_loss, zero_abl_loss
-
-
-def mean_ablate_hook(mlp_post, hook):
-    mlp_post[:] = mlp_post.mean([0, 1]).to(mlp_post.dtype)
-    return mlp_post
-
-
-def zero_ablate_hook(mlp_post, hook):
-    mlp_post[:] = 0.0
-    return mlp_post
-
-
-def kl_divergence_attention(y_true, y_pred):
-
-    # Compute log probabilities for KL divergence
-    log_y_true = torch.log2(y_true + 1e-10)
-    log_y_pred = torch.log2(y_pred + 1e-10)
-
-    return y_true * (log_y_true - log_y_pred)
