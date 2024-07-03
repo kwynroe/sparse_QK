@@ -168,7 +168,8 @@ class SparseTranscoder(HookedRootModule):
 
         previous_b_dec_out = self.b_dec_out.clone().cpu()
         all_activations = activation_store.storage_buffer.detach()
-        all_activations = einops.einsum(all_activations, self.W, "... d_model, d_model n_head d_head -> ... n_head d_head") + self.b
+        all_activations = einops.einsum(all_activations, self.W, "... d_model, n_head d_model d_head -> ... n_head d_head") + self.b
+        all_activations = einops.rearrange(all_activations, "... n_head d_head -> ... (n_head d_head)")
         all_activations = all_activations.cpu()
         out = all_activations.mean(dim=0)
 
