@@ -1,6 +1,4 @@
-"""Tweaked from Joseph Bloom's codebase to use Transcoders with SAEs being a special case:
-https://github.com/jbloomAus/mats_sae_training/blob/main/sae_training
-"""
+
 
 import gzip
 import os
@@ -16,7 +14,7 @@ from torch.distributions.categorical import Categorical
 from tqdm import tqdm
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 
-#from geomean_initialization import compute_geometric_median
+
 
 
 class SparseTranscoder(HookedRootModule):
@@ -25,6 +23,8 @@ class SparseTranscoder(HookedRootModule):
     def __init__(
         self,
         cfg,
+        W,
+        b
     ):
         super().__init__()
         self.cfg = cfg
@@ -42,6 +42,8 @@ class SparseTranscoder(HookedRootModule):
         self.eps = cfg.eps
         self.d_head = cfg.d_head
         self.n_head = cfg.n_head
+        self.W = W
+        self.b = b
 
         # NOTE: if using resampling neurons method, you must ensure that we initialise the weights in the order W_enc, b_enc, W_dec, b_dec
         self.W_enc = nn.Parameter(
@@ -59,7 +61,7 @@ class SparseTranscoder(HookedRootModule):
 
         with torch.no_grad():
             # Anthropic normalize this to have unit columns
-            self.W_enc.data /= torch.norm(self.W_enc.data, dim=1, keepdim=True)
+            self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
 
         self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.dtype, device=self.device))
         self.b_dec_out = nn.Parameter(torch.zeros(self.d_out, dtype=self.dtype, device=self.device))
@@ -136,34 +138,14 @@ class SparseTranscoder(HookedRootModule):
 
     @torch.no_grad()
     def initialize_b_dec(self, activation_store):
-
-        if self.cfg.b_dec_init_method == "geometric_median":
-            self.initialize_b_dec_with_geometric_median(activation_store)
-        elif self.cfg.b_dec_init_method == "mean":
+        if self.cfg.b_dec_init_method == "mean":
             self.initialize_b_dec_with_mean(activation_store)
+            self.initialize_b_dec_out_with_mean(activation_store)
         elif self.cfg.b_dec_init_method == "zeros":
             pass
         else:
             raise ValueError(f"Unexpected b_dec_init_method: {self.cfg.b_dec_init_method}")
 
-    @torch.no_grad()
-    def initialize_b_dec_with_geometric_median(self, activation_store):
-
-        previous_b_dec = self.b_dec.clone().cpu()
-        all_activations = activation_store.storage_buffer.detach().cpu()
-        out = compute_geometric_median(
-            all_activations, skip_typechecks=True, maxiter=100, per_component=False
-        ).median
-
-        previous_distances = torch.norm(all_activations - previous_b_dec, dim=-1)
-        distances = torch.norm(all_activations - out, dim=-1)
-
-        print("Reinitializing b_dec with geometric median of activations")
-        print(f"Previous distances: {previous_distances.median(0).values.mean().item()}")
-        print(f"New distances: {distances.median(0).values.mean().item()}")
-
-        out = torch.tensor(out, dtype=self.dtype, device=self.device)
-        self.b_dec.data = out
 
     @torch.no_grad()
     def initialize_b_dec_with_mean(self, activation_store):
@@ -176,6 +158,24 @@ class SparseTranscoder(HookedRootModule):
         distances = torch.norm(all_activations - out, dim=-1)
 
         print("Reinitializing b_dec with mean of activations")
+        print(f"Previous distances: {previous_distances.median(0).values.mean().item()}")
+        print(f"New distances: {distances.median(0).values.mean().item()}")
+
+        self.b_dec.data = out.to(self.dtype).to(self.device)
+
+    @torch.no_grad()
+    def initialize_b_dec_out_with_mean(self, activation_store):
+
+        previous_b_dec_out = self.b_dec_out.clone().cpu()
+        all_activations = activation_store.storage_buffer.detach()
+        all_activations = einops.einsum(all_activations, self.W, "... d_model, d_model n_head d_head -> ... n_head d_head") + self.b
+        all_activations = all_activations.cpu()
+        out = all_activations.mean(dim=0)
+
+        previous_distances = torch.norm(all_activations - previous_b_dec_out, dim=-1)
+        distances = torch.norm(all_activations - out, dim=-1)
+
+        print("Reinitializing b_dec_out with mean of activations")
         print(f"Previous distances: {previous_distances.median(0).values.mean().item()}")
         print(f"New distances: {distances.median(0).values.mean().item()}")
 

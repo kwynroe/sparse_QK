@@ -13,27 +13,16 @@ from ActivationStoreParallel import ActivationsStore
 from optimize import get_scheduler
 from sparse_transcoder import SparseTranscoder
 
-def apply_causal_mask(attn_scores):
 
-        mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)).cuda(), diagonal=1).bool()
-        # Apply the mask to attention scores, then return the masked scores
-        attn_scores.masked_fill_(mask, -1e9)
-        return attn_scores
-    
-    
 def train_transcoder_on_language_model_parallel(
     cfg,
     model: HookedTransformer,
-    sparse_transcoder1: SparseTranscoder,
-    sparse_transcoder2: SparseTranscoder,
+    query_transcoder: SparseTranscoder,
+    key_transcoder: SparseTranscoder,
     activation_store: ActivationsStore,
     batch_size: int = 1024,
     n_checkpoints: int = 0,
     feature_sampling_method = None,
-    feature_sampling_window: int = 1000,  # how many training steps between resampling the features / considiring neurons dead
-    feature_reinit_scale: float = 0.2,  # how much to scale the resampled features by
-    dead_feature_threshold: float = 1e-8,  # how infrequently a feature has to be active to be considered dead
-    dead_feature_window: int = 2000,  # how many training steps before a feature is considered dead
     use_wandb: bool = True,
     wandb_log_frequency: int = 1,
 ):
@@ -41,39 +30,37 @@ def train_transcoder_on_language_model_parallel(
     if feature_sampling_method is not None:
         feature_sampling_method = feature_sampling_method.lower()
 
-    total_training_tokens = sparse_transcoder1.cfg.total_training_tokens
+    total_training_tokens = query_transcoder.cfg.total_training_tokens
     total_training_steps = total_training_tokens // batch_size
     n_training_steps = 0
     n_training_tokens = 0
-    n_resampled_neurons = 0
-    steps_before_reset = 0
     if n_checkpoints > 0:
         checkpoint_thresholds = list(range(0, total_training_tokens, total_training_tokens // n_checkpoints))[1:]
     
     # track active features
-    act_freq_scores1 = torch.zeros(sparse_transcoder1.cfg.d_hidden, device=sparse_transcoder1.cfg.device)
-    act_freq_scores2 = torch.zeros(sparse_transcoder2.cfg.d_hidden, device=sparse_transcoder1.cfg.device)
-    n_forward_passes_since_fired1 = torch.zeros(sparse_transcoder1.cfg.d_hidden, device=sparse_transcoder1.cfg.device)
-    n_forward_passes_since_fired2 = torch.zeros(sparse_transcoder2.cfg.d_hidden, device=sparse_transcoder2.cfg.device)
+    act_freq_scores1 = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
+    act_freq_scores2 = torch.zeros(key_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
+    n_forward_passes_since_fired1 = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
+    n_forward_passes_since_fired2 = torch.zeros(key_transcoder.cfg.d_hidden, device=key_transcoder.cfg.device)
     n_frac_active_tokens = 0
     
-    optimizer = Adam(list(sparse_transcoder1.parameters()) + list(sparse_transcoder2.parameters()),
-                     lr = sparse_transcoder1.cfg.lr)
+    optimizer = Adam(list(query_transcoder.parameters()) + list(key_transcoder.parameters()),
+                     lr = query_transcoder.cfg.lr)
     print("gonna schedule!")
     scheduler = get_scheduler(
-        sparse_transcoder1.cfg.lr_scheduler_name,
+        query_transcoder.cfg.lr_scheduler_name,
         optimizer=optimizer,
-        warm_up_steps = sparse_transcoder1.cfg.lr_warm_up_steps, 
+        warm_up_steps = query_transcoder.cfg.lr_warm_up_steps, 
         training_steps=total_training_steps,
-        lr_end=sparse_transcoder1.cfg.lr / 10, # heuristic for now. 
+        lr_end=query_transcoder.cfg.lr / 10, # heuristic for now. 
     )
-    sparse_transcoder1.initialize_b_dec(activation_store)
-    sparse_transcoder2.initialize_b_dec(activation_store)
-    sparse_transcoder1.train()
-    sparse_transcoder2.train()
+    query_transcoder.initialize_b_dec(activation_store)
+    key_transcoder.initialize_b_dec(activation_store)
+    query_transcoder.train()
+    key_transcoder.train()
     
-    if sparse_transcoder1.cfg.attn_scores_normed:
-        attn_scores_norm = sparse_transcoder1.d_head**0.5
+    if query_transcoder.cfg.attn_scores_normed:
+        attn_scores_norm = query_transcoder.d_head**0.5
     else:
         attn_scores_norm = 1
     print("gonna progress bar!")
@@ -81,34 +68,38 @@ def train_transcoder_on_language_model_parallel(
     while n_training_tokens < total_training_tokens:
         
         # Do a training step.
-        sparse_transcoder1.train()
-        sparse_transcoder2.train()
+        query_transcoder.train()
+        key_transcoder.train()
         # Make sure the W_dec is still zero-norm
-        sparse_transcoder1.set_decoder_norm_to_unit_norm()
-        sparse_transcoder2.set_decoder_norm_to_unit_norm()
+        query_transcoder.set_decoder_norm_to_unit_norm()
+        key_transcoder.set_decoder_norm_to_unit_norm()
            
         scheduler.step()
         optimizer.zero_grad()
         
-        ghost_grad_neuron_mask1 = (n_forward_passes_since_fired1 > sparse_transcoder1.cfg.dead_feature_window).bool()
-        ghost_grad_neuron_mask2 = (n_forward_passes_since_fired2 > sparse_transcoder2.cfg.dead_feature_window).bool()
+        ghost_grad_neuron_mask1 = (n_forward_passes_since_fired1 > query_transcoder.cfg.dead_feature_window).bool()
+        ghost_grad_neuron_mask2 = (n_forward_passes_since_fired2 > key_transcoder.cfg.dead_feature_window).bool()
         data = activation_store.next_batch()
         data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)
-        true_queries = einops.einsum(model.W_Q[sparse_transcoder1.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_Q[sparse_transcoder1.layer]
-        true_keys = einops.einsum(model.W_K[sparse_transcoder1.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_K[sparse_transcoder1.layer]
-        true_scores = apply_causal_mask(einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/attn_scores_norm)
-
+        
+        #ground truth activations for loss
+        true_queries = einops.einsum(model.W_Q[query_transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_Q[query_transcoder.layer]
+        true_keys = einops.einsum(model.W_K[query_transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_K[query_transcoder.layer]
+        true_scores = einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/attn_scores_norm
+        true_patt = true_scores.log_softmax(-1)
+        
         true_queries_flatt = einops.rearrange(true_queries, " ... n_head d_head -> ... (n_head d_head)")
         true_keys_flatt = einops.rearrange(true_keys, " ... n_head d_head -> ... (n_head d_head)")
+        
+        
         # Forward and Backward Passes
-        reconstr_queries, feature_actsQ, lossQ, mse_lossQ, reg_lossQ, ghost_grad_lossQ = sparse_transcoder1(
+        reconstr_queries, feature_actsQ, lossQ, mse_lossQ, reg_lossQ, ghost_grad_lossQ = query_transcoder(
             data,
             true_queries_flatt,
             ghost_grad_neuron_mask1,
         )
         
-        
-        reconstr_keys, feature_actsK, lossK, mse_lossK, reg_lossK, ghost_grad_lossK = sparse_transcoder2(
+        reconstr_keys, feature_actsK, lossK, mse_lossK, reg_lossK, ghost_grad_lossK = key_transcoder(
             data,
             true_keys_flatt,
             ghost_grad_neuron_mask2,
@@ -117,21 +108,20 @@ def train_transcoder_on_language_model_parallel(
         reconstr_queries = einops.rearrange(reconstr_queries, " ... (n_head d_head) -> ... n_head d_head", n_head = 12)
         reconstr_keys = einops.rearrange(reconstr_keys, " ... (n_head d_head) -> ... n_head d_head", n_head = 12)
         
-        pred_attn_scores_true_keys = apply_causal_mask(einops.einsum(reconstr_queries, true_keys, " ... posnq n_head d_head, ... posnk n_head d_head -> ... n_head posnq posnk")/attn_scores_norm)
-        pred_attn_scores_true_queries = apply_causal_mask(einops.einsum(reconstr_keys, true_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm)
-        full_pred_attn_scores = apply_causal_mask(einops.einsum(reconstr_keys, reconstr_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm)
+        #Calculate attention scores using reconstructed components (full reconstructed + half reconstructed)
+        pred_attn_scores_true_keys = einops.einsum(reconstr_queries, true_keys, " ... posnq n_head d_head, ... posnk n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
+        pred_attn_scores_true_queries = einops.einsum(reconstr_keys, true_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
+        full_pred_attn_scores = einops.einsum(reconstr_keys, reconstr_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
         
+        #Error on attention scores
         attn_score_loss_true_keys = ((pred_attn_scores_true_keys) - (true_scores)).pow(2).mean()
         attn_score_loss_true_queries = ((pred_attn_scores_true_queries) - (true_scores)).pow(2).mean()
         attn_scores_loss_full_pred = ((full_pred_attn_scores) - (true_scores)).pow(2).mean()
         patt_true_keys = pred_attn_scores_true_keys.log_softmax(-1)
         patt_true_queries = pred_attn_scores_true_queries.log_softmax(-1)
-        patt_full_reconstr = full_pred_attn_scores.log_softmax(-1)
-        true_patt = true_scores.log_softmax(-1)                                   
-        #attn_score_loss_true_keys = torch.abs(torch.exp(pred_attn_scores_true_keys) - torch.exp(true_scores)).mean()
-        #attn_score_loss_true_queries = torch.abs(torch.exp(pred_attn_scores_true_queries) - torch.exp(true_scores)).mean()
-        #attn_scores_loss_full_pred = torch.abs(torch.exp(full_pred_attn_scores) - torch.exp(true_scores)).mean()
-        
+        patt_full_reconstr = full_pred_attn_scores.log_softmax(-1)                              
+
+        #Reshape patterns and compute KL-Divergences for loss
         kl_loss = torch.nn.KLDivLoss(reduction="batchmean", log_target = True)
         true_patt_flat = true_patt.view((-1, true_patt.shape[-1]))
         patt_full_reconstr = patt_full_reconstr.view((-1, patt_full_reconstr.shape[-1]))
@@ -142,22 +132,17 @@ def train_transcoder_on_language_model_parallel(
         patt_loss_true_keys = kl_loss(patt_true_keys, true_patt_flat)
         patt_loss_full_pred = kl_loss(patt_full_reconstr, true_patt_flat)
         
-        
-        #ghost_grad_scale_Q = (attn_score_loss_true_keys / (ghost_grad_lossQ + sparse_transcoder1.eps)).detach() 
-        #ghost_grad_scale_K = (attn_score_loss_true_queries / (ghost_grad_lossK + sparse_transcoder1.eps)).detach()
-        #ghost_grad_lossQ = ghost_grad_lossQ * ghost_grad_scale_Q
-        #ghost_grad_lossK = ghost_grad_lossK * ghost_grad_scale_K
-        
-        #kl_loss = torch.nn.KLDivLoss(reduction="batchmean", log_target = True)
-        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr))), dim = -1).values.mean()
+        #Calculate average max pattern error and fraction of contexts where reconstruction correctly identified most interesting source token
+        #Not very rigorous but helpful to plot while training!
+        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr)))).mean()
         frac_accurate = (torch.argmax(patt_full_reconstr, dim = -1) == torch.argmax(true_patt_flat, dim = -1)).float().mean()
         
-        #mse_lossQ + mse_lossK + 
+        #Full loss
         loss = 3*patt_loss_full_pred + patt_loss_true_queries + patt_loss_true_keys + reg_lossQ + reg_lossK + ghost_grad_lossQ + ghost_grad_lossK
         
+        #Feature Sparsity Calculations
         did_fireQ = ((feature_actsQ > 0).float().sum(0).sum(0) > 0)
         did_fireK = ((feature_actsK > 0).float().sum(0).sum(0) > 0)
-        
         n_forward_passes_since_fired1 += 1
         n_forward_passes_since_fired1[did_fireQ] = 0
         n_forward_passes_since_fired2 += 1
@@ -182,7 +167,7 @@ def train_transcoder_on_language_model_parallel(
             resid_var_k = (true_scores - pred_attn_scores_true_queries).pow(2).mean()
             explained_var_q = 1 - resid_var_q / total_variance
             explained_var_k = 1 - resid_var_k / total_variance
-            ##explained_variance = 1 - per_token_l2_loss/total_variance
+            
                 
             wandb.log(
                     {
@@ -254,19 +239,19 @@ def train_transcoder_on_language_model_parallel(
             pbar.update(batch_size)
 
         loss.backward()
-        #sparse_transcoder1.remove_gradient_parallel_to_decoder_directions()
-        #sparse_transcoder2.remove_gradient_parallel_to_decoder_directions()
+        #query_transcoder.remove_gradient_parallel_to_decoder_directions()
+        #key_transcoder.remove_gradient_parallel_to_decoder_directions()
         optimizer.step()
 
 
         # checkpoint if at checkpoint frequency
         if n_checkpoints > 0 and n_training_tokens > checkpoint_thresholds[0]:
-            cfg = sparse_transcoder1.cfg
-            path1 = f"{sparse_transcoder1.cfg.checkpoint_path}/{n_training_tokens}_{sparse_transcoder1.get_name()}.pt"
-            path2 = f"{sparse_transcoder2.cfg.checkpoint_path}/{n_training_tokens}_{sparse_transcoder2.get_name()}.pt"
+            cfg = query_transcoder.cfg
+            path1 = f"{query_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{query_transcoder.get_name()}.pt"
+            path2 = f"{key_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{key_transcoder.get_name()}.pt"
             #log_feature_sparsity_path = f"{sparse_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{sparse_transcoder.get_name()}_log_feature_sparsity.pt"
-            sparse_transcoder1.save_model(path1)
-            sparse_transcoder2.save_model(path2)
+            query_transcoder.save_model(path1)
+            key_transcoder.save_model(path2)
             #torch.save(log_feature_sparsity, log_feature_sparsity_path)
             checkpoint_thresholds.pop(0)
             if len(checkpoint_thresholds) == 0:
@@ -299,7 +284,7 @@ def train_transcoder_on_language_model_parallel(
         wandb.log_artifact(sparsity_artifact)"""
         
 
-    return sparse_transcoder1, sparse_transcoder2
+    return query_transcoder, key_transcoder
 
 
 @torch.no_grad()

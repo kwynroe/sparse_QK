@@ -15,19 +15,21 @@ def language_model_transcoder_runner_parallel(cfg1, cfg2):
     """ """
 
     model = transformer_lens.HookedTransformer.from_pretrained(cfg1.model_name, fold_ln=True)
-    sparse_transcoder1 = SparseTranscoder(cfg1)
-    sparse_transcoder2 = SparseTranscoder(cfg2)
+    W_Q, b_Q = model.W_Q[cfg1.layer], model.b_Q[cfg1.layer]
+    W_K, b_K = model.W_K[cfg1.layer], model.b_K[cfg1.layer]
+    query_transcoder = SparseTranscoder(cfg1, W_Q, b_Q)
+    key_transcoder = SparseTranscoder(cfg2, W_K, b_K)
     activations_loader = ActivationsStore(cfg1, model)
 
     if cfg1.log_to_wandb:
         wandb.init(entity = cfg1.entity, project=cfg1.wandb_project, config=cfg1, name=cfg1.run_name)
 
     # train SAE
-    sparse_transcoder1, sparse_transcoder2 = train_transcoder_on_language_model_parallel(
+    query_transcoder, key_transcoder = train_transcoder_on_language_model_parallel(
         cfg1,
         model,
-        sparse_transcoder1,
-        sparse_transcoder2,
+        query_transcoder,
+        key_transcoder,
         activations_loader,
         n_checkpoints=cfg1.n_checkpoints,
         batch_size=cfg1.train_batch_size,
@@ -41,10 +43,10 @@ def language_model_transcoder_runner_parallel(cfg1, cfg2):
     )
 
     # save sae to checkpoints folder
-    path = f"{cfg1.checkpoint_path}/final_{sparse_transcoder1.get_name()}.pt"
-    sparse_transcoder1.save_model(path)
-    path = f"{cfg2.checkpoint_path}/final_{sparse_transcoder2.get_name()}.pt"
-    sparse_transcoder2.save_model(path)
+    path = f"{cfg1.checkpoint_path}/final_{query_transcoder.get_name()}.pt"
+    query_transcoder.save_model(path)
+    path = f"{cfg2.checkpoint_path}/final_{key_transcoder.get_name()}.pt"
+    key_transcoder.save_model(path)
     # upload to wandb
     """
     if cfg.log_to_wandb:
@@ -58,4 +60,4 @@ def language_model_transcoder_runner_parallel(cfg1, cfg2):
     if cfg1.log_to_wandb:
         wandb.finish()
 
-    return sparse_transcoder1, sparse_transcoder2
+    return query_transcoder, key_transcoder
