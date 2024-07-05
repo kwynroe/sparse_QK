@@ -83,8 +83,6 @@ def train_transcoder_on_language_model_parallel(
         scheduler.step()
         optimizer.zero_grad()
         
-        ghost_grad_neuron_mask1 = (n_forward_passes_since_fired1 > query_transcoder.cfg.dead_feature_window).bool()
-        ghost_grad_neuron_mask2 = (n_forward_passes_since_fired2 > key_transcoder.cfg.dead_feature_window).bool()
         data = activation_store.next_batch()
         data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)
         
@@ -99,16 +97,14 @@ def train_transcoder_on_language_model_parallel(
         
         
         # Forward and Backward Passes
-        reconstr_queries, feature_actsQ, lossQ, mse_lossQ, reg_lossQ, ghost_grad_lossQ = query_transcoder(
+        reconstr_queries, feature_actsQ, mse_lossQ, reg_lossQ= query_transcoder(
             data,
-            true_queries_flatt,
-            ghost_grad_neuron_mask1,
+            true_queries_flatt
         )
         
-        reconstr_keys, feature_actsK, lossK, mse_lossK, reg_lossK, ghost_grad_lossK = key_transcoder(
+        reconstr_keys, feature_actsK,  mse_lossK, reg_lossK = key_transcoder(
             data,
-            true_keys_flatt,
-            ghost_grad_neuron_mask2,
+            true_keys_flatt
         )
         
         reconstr_queries = einops.rearrange(reconstr_queries, " ... (n_head d_head) -> ... n_head d_head", n_head = 12)
@@ -144,7 +140,7 @@ def train_transcoder_on_language_model_parallel(
         frac_accurate = (torch.argmax(patt_full_reconstr, dim = -1) == torch.argmax(true_patt_flat, dim = -1)).float().mean()
         
         #Full loss
-        loss = 3*patt_loss_full_pred + patt_loss_true_queries + patt_loss_true_keys + reg_lossQ + reg_lossK + ghost_grad_lossQ + ghost_grad_lossK
+        loss = 3*patt_loss_full_pred + patt_loss_true_queries + patt_loss_true_keys + reg_lossQ + reg_lossK
         
         #Feature Sparsity Calculations
         did_fireQ = ((feature_actsQ > 0).float().sum(0).sum(0) > 0)

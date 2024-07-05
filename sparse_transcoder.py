@@ -99,42 +99,12 @@ class SparseTranscoder(HookedRootModule):
 
         # add config for whether l2 is normalized:
         mse_loss = (transcoder_out - target.float()).pow(2).sum(-1).mean()
-  
-        mse_loss_ghost_resid = torch.tensor(0.0, dtype=self.dtype, device=self.device)
-        # gate on config and training so evals is not slowed down.
-        if self.cfg.use_ghost_grads and self.training and dead_neuron_mask.sum() > 0:
-            assert dead_neuron_mask is not None
 
-            # ghost protocol
-
-            # 1.
-            residual = target - transcoder_out
-            residual_centred = residual - residual.mean(dim=0, keepdim=True)
-            l2_norm_residual = torch.norm(residual, dim=-1)
-
-            # 2.
-            feature_acts_dead_neurons_only = torch.exp(hidden_pre[:, dead_neuron_mask])
-            ghost_out = feature_acts_dead_neurons_only @ self.W_dec[dead_neuron_mask, :]
-            l2_norm_ghost_out = torch.norm(ghost_out, dim=-1)
-            norm_scaling_factor = l2_norm_residual / (l2_norm_ghost_out * 2 + self.eps)
-            ghost_out = ghost_out * norm_scaling_factor[:, None].detach()
-
-            # 3.
-            mse_loss_ghost_resid = (
-                torch.pow((ghost_out - residual.detach().float()), 2)
-                / (residual_centred.detach() ** 2).sum(dim=-1, keepdim=True).sqrt()
-            )
-            mse_rescaling_factor = (mse_loss / (mse_loss_ghost_resid + self.eps)).detach()
-            mse_loss_ghost_resid = mse_rescaling_factor * mse_loss_ghost_resid
-            
-            mse_loss_ghost_resid = mse_loss_ghost_resid.mean()
-
-        mse_loss_ghost_resid = mse_loss_ghost_resid.mean()
         mse_loss = mse_loss.mean()
         reg_loss = self.reg_coefficient * torch.sqrt(feature_acts.float().abs() + self.eps).sum()
-        loss = mse_loss + reg_loss + mse_loss_ghost_resid
 
-        return transcoder_out, feature_acts, loss, mse_loss, reg_loss, mse_loss_ghost_resid
+
+        return transcoder_out, feature_acts, mse_loss, reg_loss
 
     @torch.no_grad()
     def initialize_b_dec(self, activation_store):
