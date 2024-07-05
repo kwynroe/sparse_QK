@@ -140,7 +140,7 @@ def train_transcoder_on_language_model_parallel(
         
         #Calculate average max pattern error and fraction of contexts where reconstruction correctly identified most interesting source token
         #Not very rigorous but helpful to plot while training!
-        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr)))).mean()
+        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr))), dim = -1).values.mean()
         frac_accurate = (torch.argmax(patt_full_reconstr, dim = -1) == torch.argmax(true_patt_flat, dim = -1)).float().mean()
         
         #Full loss
@@ -182,21 +182,19 @@ def train_transcoder_on_language_model_parallel(
                                 "losses/mse_lossQ": mse_lossQ.item(),
                                 "losses/mse_lossK": mse_lossK.item(),
                                 "losses/reg_lossQ": reg_lossQ.item(),
-                                "losses/reg_lossK": reg_lossK.item(),# normalize by reg coefficient
+                                "losses/reg_lossK": reg_lossK.item(),
                                 "losses/patt_lossQ": patt_loss_true_keys.item(),
                                 "losses/patt_lossK": patt_loss_true_queries.item(),
                                 "losses/patt_loss_full": patt_loss_full_pred.item(),
-                                # variance explained
-                                "metrics/var_explained_Q" : explained_var_q.item(),
-                                "metrics/var_explained_K" : explained_var_k.item(),
+                                
+                                # metrics
                                 "metrics/full_pred_diff": attn_scores_loss_full_pred.item(),
                                 "metrics/loss_true_keys": attn_score_loss_true_keys.item(),
                                 "metrics/loss_true_queries": attn_score_loss_true_queries.item(),
                                 "metrics/l0_Q": l0_Q.item(),
                                 "metrics/l0_K": l0_K.item(),
-                                #"metrics/score_var": total_variance.item(),
-                                # sparsity
 
+                                # sparsity
                                 "sparsity/below_1e-5_Q": (feature_sparsity1 < 1e-5)
                                 .float()
                                 .mean()
@@ -222,7 +220,7 @@ def train_transcoder_on_language_model_parallel(
                                 .mean()
                                 .item(),
                                 
-
+                                #misc details
                                 "details/n_training_tokens": n_training_tokens,
                                 "details/pred_key_mean": reconstr_keys.mean().item(),
                                 "details/pred_query_mean": reconstr_queries.mean().item(),
@@ -233,13 +231,6 @@ def train_transcoder_on_language_model_parallel(
                             },
                             step=n_training_steps,
                     )
-
-            # record loss frequently, but not all the time.
-            """if use_wandb and ((n_training_steps + 1) % (wandb_log_frequency * 10) == 0):
-                sparse_transcoder.eval()
-                run_evals(sparse_transcoder, activation_store, model, n_training_steps)
-                sparse_transcoder.train()"""
-                
             pbar.set_description(
                 f"{n_training_steps}| MSE Loss {loss.item():.3f}"
             )
@@ -262,34 +253,8 @@ def train_transcoder_on_language_model_parallel(
             #torch.save(log_feature_sparsity, log_feature_sparsity_path)
             checkpoint_thresholds.pop(0)
             if len(checkpoint_thresholds) == 0:
-                n_checkpoints = 0
-            """
-            if cfg.log_to_wandb:
-                model_artifact = wandb.Artifact(
-                    f"{sparse_transcoder.get_name()}", type="model", metadata=dict(cfg.__dict__)
-                )
-                model_artifact.add_file(path)
-                wandb.log_artifact(model_artifact)
-                
-                sparsity_artifact = wandb.Artifact(
-                    f"{sparse_transcoder.get_name()}_log_feature_sparsity", type="log_feature_sparsity", metadata=dict(cfg.__dict__)
-                )
-                sparsity_artifact.add_file(log_feature_sparsity_path)
-                wandb.log_artifact(sparsity_artifact)"""
-                
-            
+                n_checkpoints = 0        
         n_training_steps += 1
-    """
-    log_feature_sparsity_path = f"{sparse_transcoder.cfg.checkpoint_path}/final_{sparse_transcoder.get_name()}_log_feature_sparsity.pt"
-    sparse_transcoder.save_model(path)
-    torch.save(log_feature_sparsity, log_feature_sparsity_path)
-    if cfg.log_to_wandb:
-        sparsity_artifact = wandb.Artifact(
-                f"{sparse_transcoder.get_name()}_log_feature_sparsity", type="log_feature_sparsity", metadata=dict(cfg.__dict__)
-            )
-        sparsity_artifact.add_file(log_feature_sparsity_path)
-        wandb.log_artifact(sparsity_artifact)"""
-        
 
     return query_transcoder, key_transcoder
 
