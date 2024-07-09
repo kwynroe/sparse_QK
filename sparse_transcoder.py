@@ -24,16 +24,18 @@ class SparseTranscoder(HookedRootModule):
         self,
         cfg,
         W,
-        b
+        b,
+        is_query
     ):
         super().__init__()
+        self.is_query = is_query
         self.cfg = cfg
         self.layer = cfg.layer
         self.d_in = cfg.d_in
         if not isinstance(self.d_in, int):
             raise ValueError(f"d_in must be an int but was {self.d_in=}; {type(self.d_in)=}")
         self.d_out = cfg.d_out
-        if not isinstance(self.d_in, int):
+        if not isinstance(self.d_out, int):
             raise ValueError(f"d_out must be an int but was {self.d_out=}; {type(self.d_out)=}")
         self.d_hidden = cfg.d_hidden
         self.reg_coefficient = cfg.reg_coefficient
@@ -158,8 +160,8 @@ class SparseTranscoder(HookedRootModule):
         A method for running the model with the Transcoder activations in order to return the loss.
         returns per token loss when activations are substituted in.
         """
-        input_hook = self.cfg.hook_transcoder_in
-        target_hook = self.cfg.hook_transcoder_out
+        input_hook = self.cfg.hook_transcoder_in_q if self.is_query else self.cfg.hook_transcoder_in_k
+        target_hook = self.cfg.hook_transcoder_out_q if self.is_query else self.cfg.hook_transcoder_out_k
 
         comp_cache = None
 
@@ -276,7 +278,8 @@ class SparseTranscoder(HookedRootModule):
         return instance
 
     def get_name(self):
+        this_type = self.cfg.type_q if self.is_query else self.cfg.type_k
         transcoder_name = (
-            f"sparse_transcoder_{self.cfg.model_name}_{self.cfg.type}_{self.cfg.d_hidden}"
+            f"sparse_transcoder_{self.cfg.model_name}_{this_type}_{self.cfg.d_hidden}"
         )
         return transcoder_name

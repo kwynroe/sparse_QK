@@ -20,34 +20,31 @@ def apply_causal_mask(attn_scores):
         return attn_scores
 
 
+
+
 def train_transcoder_on_language_model_parallel(
     cfg,
     model: HookedTransformer,
     query_transcoder: SparseTranscoder,
     key_transcoder: SparseTranscoder,
     activation_store: ActivationsStore,
-    batch_size: int = 1024,
-    n_checkpoints: int = 0,
-    feature_sampling_method = None,
-    use_wandb: bool = True,
-    wandb_log_frequency: int = 1,
 ):
     print("TRAIN STARTED")
-    if feature_sampling_method is not None:
-        feature_sampling_method = feature_sampling_method.lower()
+    # if feature_sampling_method is not None:    # TODO felix: seems not to be used?
+    #     feature_sampling_method = feature_sampling_method.lower()
 
-    total_training_tokens = query_transcoder.cfg.total_training_tokens
-    total_training_steps = total_training_tokens // batch_size
+    total_training_tokens = cfg.total_training_tokens
+    total_training_steps = total_training_tokens // cfg.train_batch_size
     n_training_steps = 0
     n_training_tokens = 0
-    if n_checkpoints > 0:
-        checkpoint_thresholds = list(range(0, total_training_tokens, total_training_tokens // n_checkpoints))[1:]
+    if cfg.n_checkpoints > 0:
+        checkpoint_thresholds = list(range(0, total_training_tokens, total_training_tokens // cfg.n_checkpoints))[1:]
     
     # track active features
-    act_freq_scores1 = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
-    act_freq_scores2 = torch.zeros(key_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
-    n_forward_passes_since_fired1 = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
-    n_forward_passes_since_fired2 = torch.zeros(key_transcoder.cfg.d_hidden, device=key_transcoder.cfg.device)
+    act_freq_scores_q = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
+    act_freq_scores_k = torch.zeros(key_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
+    n_forward_passes_since_fired_q = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
+    n_forward_passes_since_fired_k = torch.zeros(key_transcoder.cfg.d_hidden, device=key_transcoder.cfg.device)
     n_frac_active_tokens = 0
     
     optimizer = Adam(list(query_transcoder.parameters()) + list(key_transcoder.parameters()),
@@ -145,19 +142,19 @@ def train_transcoder_on_language_model_parallel(
         #Feature Sparsity Calculations
         did_fireQ = ((feature_actsQ > 0).float().sum(0).sum(0) > 0)
         did_fireK = ((feature_actsK > 0).float().sum(0).sum(0) > 0)
-        n_forward_passes_since_fired1 += 1
-        n_forward_passes_since_fired1[did_fireQ] = 0
-        n_forward_passes_since_fired2 += 1
-        n_forward_passes_since_fired2[did_fireK] = 0
-        n_training_tokens += batch_size
+        n_forward_passes_since_fired_q += 1
+        n_forward_passes_since_fired_q[did_fireQ] = 0
+        n_forward_passes_since_fired_k += 1
+        n_forward_passes_since_fired_k[did_fireK] = 0
+        n_training_tokens += cfg.train_batch_size
 
         with torch.no_grad():
             # Calculate the sparsities, and add it to a list, calculate sparsity metrics
-            act_freq_scores1 += (feature_actsQ.abs() > 0).float().sum(0).sum(0)
-            act_freq_scores2 += (feature_actsK.abs() > 0).float().sum(0).sum(0)
-            n_frac_active_tokens += batch_size
-            feature_sparsity1 = act_freq_scores1 / n_frac_active_tokens
-            feature_sparsity2 = act_freq_scores2 / n_frac_active_tokens
+            act_freq_scores_q += (feature_actsQ.abs() > 0).float().sum(0).sum(0)
+            act_freq_scores_k += (feature_actsK.abs() > 0).float().sum(0).sum(0)
+            n_frac_active_tokens += cfg.train_batch_size
+            feature_sparsity1 = act_freq_scores_q / n_frac_active_tokens
+            feature_sparsity2 = act_freq_scores_k / n_frac_active_tokens
             l0_Q = (feature_actsQ > 0).float().sum(-1).mean()
             l0_K = (feature_actsK > 0).float().sum(-1).mean()
             current_learning_rate = optimizer.param_groups[0]["lr"]
@@ -170,8 +167,8 @@ def train_transcoder_on_language_model_parallel(
             explained_var_q = 1 - resid_var_q / total_variance
             explained_var_k = 1 - resid_var_k / total_variance
             
-            if use_wandb:
-                if (n_training_steps + 1) % wandb_log_frequency == 0:
+            if cfg.log_to_wandb:
+                if (n_training_steps + 1) % cfg.wandb_log_frequency == 0:
                     wandb.log(
                             {
                                 # losses
@@ -230,7 +227,7 @@ def train_transcoder_on_language_model_parallel(
             pbar.set_description(
                 f"{n_training_steps}| MSE Loss {loss.item():.3f}"
             )
-            pbar.update(batch_size)
+            pbar.update(cfg.train_batch_size)
 
         loss.backward()
         #query_transcoder.remove_gradient_parallel_to_decoder_directions()
@@ -239,7 +236,7 @@ def train_transcoder_on_language_model_parallel(
 
 
         # checkpoint if at checkpoint frequency
-        if n_checkpoints > 0 and n_training_tokens > checkpoint_thresholds[0]:
+        if cfg.n_checkpoints > 0 and n_training_tokens > checkpoint_thresholds[0]:
             cfg = query_transcoder.cfg
             path1 = f"{query_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{query_transcoder.get_name()}.pt"
             path2 = f"{key_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{key_transcoder.get_name()}.pt"
@@ -249,7 +246,7 @@ def train_transcoder_on_language_model_parallel(
             #torch.save(log_feature_sparsity, log_feature_sparsity_path)
             checkpoint_thresholds.pop(0)
             if len(checkpoint_thresholds) == 0:
-                n_checkpoints = 0        
+                cfg.n_checkpoints = 0        
         n_training_steps += 1
 
     return query_transcoder, key_transcoder

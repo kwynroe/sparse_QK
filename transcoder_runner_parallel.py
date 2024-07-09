@@ -11,43 +11,34 @@ from sparse_transcoder import SparseTranscoder
 from transcoder_training_parallel import train_transcoder_on_language_model_parallel
 
 
-def language_model_transcoder_runner_parallel(cfg1, cfg2):
-    """ """
+def language_model_transcoder_runner_parallel(cfg):
+    model = transformer_lens.HookedTransformer.from_pretrained(cfg.model_name, fold_ln=True)
+    W_Q, b_Q = model.W_Q[cfg.layer], model.b_Q[cfg.layer]
+    W_K, b_K = model.W_K[cfg.layer], model.b_K[cfg.layer]
+    query_transcoder = SparseTranscoder(cfg, W_Q, b_Q, is_query=True)
+    key_transcoder = SparseTranscoder(cfg, W_K, b_K, is_query=False)
+    activations_loader = ActivationsStore(cfg, model)
 
-    model = transformer_lens.HookedTransformer.from_pretrained(cfg1.model_name, fold_ln=True)
-    W_Q, b_Q = model.W_Q[cfg1.layer], model.b_Q[cfg1.layer]
-    W_K, b_K = model.W_K[cfg1.layer], model.b_K[cfg1.layer]
-    query_transcoder = SparseTranscoder(cfg1, W_Q, b_Q)
-    key_transcoder = SparseTranscoder(cfg2, W_K, b_K)
-    activations_loader = ActivationsStore(cfg1, model)
+    if cfg.log_to_wandb:
+        wandb.init(entity=cfg.entity, project=cfg.wandb_project, config=cfg, name=cfg.run_name)
 
-    if cfg1.log_to_wandb:
-        wandb.init(entity = cfg1.entity, project=cfg1.wandb_project, config=cfg1, name=cfg1.run_name)
-
-    # train SAE
+    # train SAE.
     query_transcoder, key_transcoder = train_transcoder_on_language_model_parallel(
-        cfg1,
+        cfg,
         model,
         query_transcoder,
         key_transcoder,
-        activations_loader,
-        n_checkpoints=cfg1.n_checkpoints,
-        batch_size=cfg1.train_batch_size,
-        feature_sampling_method=cfg1.feature_sampling_method,
-        feature_sampling_window=cfg1.feature_sampling_window,
-        feature_reinit_scale=cfg1.feature_reinit_scale,
-        dead_feature_threshold=cfg1.dead_feature_threshold,
-        dead_feature_window=cfg1.dead_feature_window,
-        use_wandb=cfg1.log_to_wandb,
-        wandb_log_frequency=cfg1.wandb_log_frequency,
+        activations_loader
     )
 
-    # save sae to checkpoints folder
-    path = f"{cfg1.checkpoint_path}/final_{query_transcoder.get_name()}.pt"
-    query_transcoder.save_model(path)
-    path = f"{cfg2.checkpoint_path}/final_{key_transcoder.get_name()}.pt"
-    key_transcoder.save_model(path)
-    # upload to wandb
+    # save transcoder.
+    path_q = f"{cfg.checkpoint_path}/final_{query_transcoder.get_name()}.pt"
+    query_transcoder.save_model(path_q)
+    path_k = f"{cfg.checkpoint_path}/final_{key_transcoder.get_name()}.pt"
+    key_transcoder.save_model(path_k)
+
+
+    # upload to wandb - FELIX TODO: not sure what this is doing.
     """
     if cfg.log_to_wandb:
         model_artifact = wandb.Artifact(
@@ -57,7 +48,7 @@ def language_model_transcoder_runner_parallel(cfg1, cfg2):
         wandb.log_artifact(model_artifact, aliases=["final_model"])
         """
 
-    if cfg1.log_to_wandb:
+    if cfg.log_to_wandb:
         wandb.finish()
 
     return query_transcoder, key_transcoder
