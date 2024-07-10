@@ -12,6 +12,7 @@ import wandb
 from ActivationStoreParallel import ActivationsStore
 from optimize import get_scheduler
 from sparse_transcoder import SparseTranscoder
+from metrics_training import WandbLogger
 
 def apply_causal_mask(attn_scores):
         mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)).cuda(), diagonal=1).bool()
@@ -29,8 +30,7 @@ def train_transcoder_on_language_model_parallel(
     key_transcoder: SparseTranscoder,
     activation_store: ActivationsStore,
 ):
-    print("TRAIN STARTED")
-    # if feature_sampling_method is not None:    # TODO felix: seems not to be used?
+    # if feature_sampling_method is not None:    # TODO: seems not to be used?
     #     feature_sampling_method = feature_sampling_method.lower()
 
     total_training_tokens = cfg.total_training_tokens
@@ -40,16 +40,13 @@ def train_transcoder_on_language_model_parallel(
     if cfg.n_checkpoints > 0:
         checkpoint_thresholds = list(range(0, total_training_tokens, total_training_tokens // cfg.n_checkpoints))[1:]
     
-    # track active features
-    act_freq_scores_q = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
-    act_freq_scores_k = torch.zeros(key_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
-    n_forward_passes_since_fired_q = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
-    n_forward_passes_since_fired_k = torch.zeros(key_transcoder.cfg.d_hidden, device=key_transcoder.cfg.device)
-    n_frac_active_tokens = 0
+    # track active features TODO: think these are no longer used
+    # n_forward_passes_since_fired_q = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
+    # n_forward_passes_since_fired_k = torch.zeros(key_transcoder.cfg.d_hidden, device=key_transcoder.cfg.device)
     
+    # Optimizer and scheduler.
     optimizer = Adam(list(query_transcoder.parameters()) + list(key_transcoder.parameters()),
                      lr = query_transcoder.cfg.lr)
-    print("gonna schedule!")
     scheduler = get_scheduler(
         query_transcoder.cfg.lr_scheduler_name,
         optimizer=optimizer,
@@ -58,7 +55,7 @@ def train_transcoder_on_language_model_parallel(
         lr_end=query_transcoder.cfg.lr / 10, # heuristic for now. 
     )
 
-    # Initialisation.
+    print("Initializing autoencoders.")
     W_Q, b_Q = model.W_Q[cfg.layer], model.b_Q[cfg.layer]
     W_K, b_K = model.W_K[cfg.layer], model.b_K[cfg.layer]
     query_transcoder.initialize_b_dec(activation_store, W_Q, b_Q)
@@ -71,13 +68,17 @@ def train_transcoder_on_language_model_parallel(
         attn_scores_norm = query_transcoder.d_head**0.5
     else:
         attn_scores_norm = 1
-    print("gonna progress bar!")
+        
+    # Initialise logging.
+    wandb_logger = WandbLogger(cfg, query_transcoder, key_transcoder, optimizer)
+
     pbar = tqdm(total=total_training_tokens, desc="Training SAE")
     while n_training_tokens < total_training_tokens:
         
-        # Do a training step.
+        # Do a training step. - TODO: think these might be redundant?
         query_transcoder.train()
         key_transcoder.train()
+
         # Make sure the W_dec is still zero-norm
         query_transcoder.set_decoder_norm_to_unit_norm()
         key_transcoder.set_decoder_norm_to_unit_norm()
@@ -136,103 +137,49 @@ def train_transcoder_on_language_model_parallel(
         patt_loss_true_keys = kl_loss(patt_true_keys, true_patt_flat)
         patt_loss_full_pred = kl_loss(patt_full_reconstr, true_patt_flat)
         
-        #Calculate average max pattern error and fraction of contexts where reconstruction correctly identified most interesting source token
-        #Not very rigorous but helpful to plot while training!
-        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr))), dim = -1).values.mean()
-        frac_accurate = (torch.argmax(patt_full_reconstr, dim = -1) == torch.argmax(true_patt_flat, dim = -1)).float().mean()
         
         #Full loss
         loss = 3*patt_loss_full_pred + patt_loss_true_queries + patt_loss_true_keys + reg_lossQ + reg_lossK
         
-        #Feature Sparsity Calculations
-        did_fireQ = ((feature_actsQ > 0).float().sum(0).sum(0) > 0)
-        did_fireK = ((feature_actsK > 0).float().sum(0).sum(0) > 0)
-        n_forward_passes_since_fired_q += 1
-        n_forward_passes_since_fired_q[did_fireQ] = 0
-        n_forward_passes_since_fired_k += 1
-        n_forward_passes_since_fired_k[did_fireK] = 0
+        #Feature Sparsity Calculations - TODO: not used?
+        # did_fireQ = ((feature_actsQ > 0).float().sum(0).sum(0) > 0)
+        # did_fireK = ((feature_actsK > 0).float().sum(0).sum(0) > 0)
+        # n_forward_passes_since_fired_q += 1
+        # n_forward_passes_since_fired_q[did_fireQ] = 0
+        # n_forward_passes_since_fired_k += 1
+        # n_forward_passes_since_fired_k[did_fireK] = 0
         n_training_tokens += cfg.train_batch_size
 
-        with torch.no_grad():
-            # Calculate the sparsities, and add it to a list, calculate sparsity metrics
-            act_freq_scores_q += (feature_actsQ.abs() > 0).float().sum(0).sum(0)
-            act_freq_scores_k += (feature_actsK.abs() > 0).float().sum(0).sum(0)
-            n_frac_active_tokens += cfg.train_batch_size
-            feature_sparsity1 = act_freq_scores_q / n_frac_active_tokens
-            feature_sparsity2 = act_freq_scores_k / n_frac_active_tokens
-            l0_Q = (feature_actsQ > 0).float().sum(-1).mean()
-            l0_K = (feature_actsK > 0).float().sum(-1).mean()
-            current_learning_rate = optimizer.param_groups[0]["lr"]
-                
-            #per_token_l2_loss = (transcoder_out - target).pow(2).sum(dim=-1).squeeze()
-            total_variance = (true_scores - true_scores.mean()).pow(2).mean()
-            
-            resid_var_q = (true_scores - pred_attn_scores_true_keys).pow(2).mean()
-            resid_var_k = (true_scores - pred_attn_scores_true_queries).pow(2).mean()
-            explained_var_q = 1 - resid_var_q / total_variance
-            explained_var_k = 1 - resid_var_k / total_variance
-            
-            if cfg.log_to_wandb:
-                if (n_training_steps + 1) % cfg.wandb_log_frequency == 0:
-                    wandb.log(
-                            {
-                                # losses
-                                "losses/mse_lossQ": mse_lossQ.item(),
-                                "losses/mse_lossK": mse_lossK.item(),
-                                "losses/reg_lossQ": reg_lossQ.item(),
-                                "losses/reg_lossK": reg_lossK.item(),
-                                "losses/patt_lossQ": patt_loss_true_keys.item(),
-                                "losses/patt_lossK": patt_loss_true_queries.item(),
-                                "losses/patt_loss_full": patt_loss_full_pred.item(),
-                                
-                                # metrics
-                                "metrics/full_pred_diff": attn_scores_loss_full_pred.item(),
-                                "metrics/loss_true_keys": attn_score_loss_true_keys.item(),
-                                "metrics/loss_true_queries": attn_score_loss_true_queries.item(),
-                                "metrics/l0_Q": l0_Q.item(),
-                                "metrics/l0_K": l0_K.item(),
-
-                                # sparsity
-                                "sparsity/below_1e-5_Q": (feature_sparsity1 < 1e-5)
-                                .float()
-                                .mean()
-                                .item(),
-                                "sparsity/above_1e-1_K": (feature_sparsity1 > 1e-1)
-                                .float()
-                                .mean()
-                                .item(),
-                                "sparsity/above_1e-1_Q": (feature_sparsity2 > 1e-1)
-                                .float()
-                                .mean()
-                                .item(),
-                                "sparsity/below_1e-5_K": (feature_sparsity2 < 1e-5)
-                                .float()
-                                .mean()
-                                .item(),
-                                "sparsity/avg_log_freq_K": (torch.log10(feature_sparsity2).mean())
-                                .float()
-                                .mean()
-                                .item(),
-                                "sparsity/avg_log_freq_Q": (torch.log10(feature_sparsity1).mean())
-                                .float()
-                                .mean()
-                                .item(),
-                                
-                                #misc details
-                                "details/n_training_tokens": n_training_tokens,
-                                "details/pred_key_mean": reconstr_keys.mean().item(),
-                                "details/pred_query_mean": reconstr_queries.mean().item(),
-                                "details/patt_max_diff": patt_max_diff.item(),
-                                "details/frac_acc": frac_accurate.item(),
-                                "details/lr": current_learning_rate
-
-                            },
-                            step=n_training_steps,
-                    )
-            pbar.set_description(
-                f"{n_training_steps}| MSE Loss {loss.item():.3f}"
+        if cfg.log_to_wandb and (n_training_steps + 1) % cfg.wandb_log_frequency == 0:
+            print("Logging to wandb")
+            wandb_logger.log_to_wandb(
+                feature_actsQ,
+                feature_actsK,
+                mse_lossQ,
+                mse_lossK,
+                reg_lossQ,
+                reg_lossK,
+                true_scores,
+                n_training_tokens,
+                reconstr_keys,
+                reconstr_queries,
+                patt_loss_true_keys,
+                patt_loss_true_queries,
+                patt_loss_full_pred,
+                attn_scores_loss_full_pred,
+                attn_score_loss_true_keys,
+                attn_score_loss_true_queries,
+                true_patt_flat,
+                patt_full_reconstr,
+                pred_attn_scores_true_keys,
+                pred_attn_scores_true_queries,
+                n_training_steps,
             )
-            pbar.update(cfg.train_batch_size)
+
+        pbar.set_description(
+            f"{n_training_steps}| MSE Loss {loss.item():.3f}"
+        )
+        pbar.update(cfg.train_batch_size)
 
         loss.backward()
         #query_transcoder.remove_gradient_parallel_to_decoder_directions()
@@ -243,11 +190,11 @@ def train_transcoder_on_language_model_parallel(
         # checkpoint if at checkpoint frequency
         if cfg.n_checkpoints > 0 and n_training_tokens > checkpoint_thresholds[0]:
             cfg = query_transcoder.cfg
-            path1 = f"{query_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{query_transcoder.get_name()}.pt"
-            path2 = f"{key_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{key_transcoder.get_name()}.pt"
+            path_q = f"{query_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{query_transcoder.get_name()}.pt"
+            path_k = f"{key_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{key_transcoder.get_name()}.pt"
             #log_feature_sparsity_path = f"{sparse_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{sparse_transcoder.get_name()}_log_feature_sparsity.pt"
-            query_transcoder.save_model(path1)
-            key_transcoder.save_model(path2)
+            query_transcoder.save_model(path_q)
+            key_transcoder.save_model(path_k)
             #torch.save(log_feature_sparsity, log_feature_sparsity_path)
             checkpoint_thresholds.pop(0)
             if len(checkpoint_thresholds) == 0:
