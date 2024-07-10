@@ -23,17 +23,17 @@ class SparseTranscoder(HookedRootModule):
     def __init__(
         self,
         cfg,
-        W,
-        b
+        is_query=False,
     ):
         super().__init__()
+        self.is_query = is_query
         self.cfg = cfg
         self.layer = cfg.layer
         self.d_in = cfg.d_in
         if not isinstance(self.d_in, int):
             raise ValueError(f"d_in must be an int but was {self.d_in=}; {type(self.d_in)=}")
         self.d_out = cfg.d_out
-        if not isinstance(self.d_in, int):
+        if not isinstance(self.d_out, int):
             raise ValueError(f"d_out must be an int but was {self.d_out=}; {type(self.d_out)=}")
         self.d_hidden = cfg.d_hidden
         self.reg_coefficient = cfg.reg_coefficient
@@ -42,8 +42,6 @@ class SparseTranscoder(HookedRootModule):
         self.eps = cfg.eps
         self.d_head = cfg.d_head
         self.n_head = cfg.n_head
-        self.W = W
-        self.b = b
 
         # NOTE: if using resampling neurons method, you must ensure that we initialise the weights in the order W_enc, b_enc, W_dec, b_dec
         self.W_enc = nn.Parameter(
@@ -107,10 +105,12 @@ class SparseTranscoder(HookedRootModule):
         return transcoder_out, feature_acts, mse_loss, reg_loss
 
     @torch.no_grad()
-    def initialize_b_dec(self, activation_store):
+    def initialize_b_dec(self, activation_store, model_W=None, model_b=None):
         if self.cfg.b_dec_init_method == "mean":
+            if model_W is None or model_b is None:
+                raise ValueError("Model weights required for mean initialisation in initialise_b_dec.")
             self.initialize_b_dec_with_mean(activation_store)
-            self.initialize_b_dec_out_with_mean(activation_store)
+            self.initialize_b_dec_out_with_mean(activation_store, model_W, model_b)
         elif self.cfg.b_dec_init_method == "zeros":
             pass
         else:
@@ -134,11 +134,11 @@ class SparseTranscoder(HookedRootModule):
         self.b_dec.data = out.to(self.dtype).to(self.device)
 
     @torch.no_grad()
-    def initialize_b_dec_out_with_mean(self, activation_store):
+    def initialize_b_dec_out_with_mean(self, activation_store, model_W, model_b):
 
         previous_b_dec_out = self.b_dec_out.clone().cpu()
         all_activations = activation_store.storage_buffer.detach()
-        all_activations = einops.einsum(all_activations, self.W, "... d_model, n_head d_model d_head -> ... n_head d_head") + self.b
+        all_activations = einops.einsum(all_activations, model_W, "... d_model, n_head d_model d_head -> ... n_head d_head") + model_b
         all_activations = einops.rearrange(all_activations, "... n_head d_head -> ... (n_head d_head)")
         all_activations = all_activations.cpu()
         out = all_activations.mean(dim=0)
@@ -158,8 +158,8 @@ class SparseTranscoder(HookedRootModule):
         A method for running the model with the Transcoder activations in order to return the loss.
         returns per token loss when activations are substituted in.
         """
-        input_hook = self.cfg.hook_transcoder_in
-        target_hook = self.cfg.hook_transcoder_out
+        input_hook = self.cfg.hook_transcoder_in_q if self.is_query else self.cfg.hook_transcoder_in_k
+        target_hook = self.cfg.hook_transcoder_out_q if self.is_query else self.cfg.hook_transcoder_out_k
 
         comp_cache = None
 
@@ -227,7 +227,7 @@ class SparseTranscoder(HookedRootModule):
         print(f"Saved model to {path}")
 
     @classmethod
-    def load_from_pretrained(cls, path: str):
+    def load_from_pretrained(cls, path: str, is_query=True):
         """
         Load function for the model. Loads the model's state_dict and the config used to train it.
         This method can be called directly on the class, without needing an instance.
@@ -270,13 +270,14 @@ class SparseTranscoder(HookedRootModule):
             raise ValueError("The loaded state dictionary must contain 'cfg' and 'state_dict' keys")
 
         # Create an instance of the class using the loaded configuration
-        instance = cls(cfg=state_dict["cfg"])
+        instance = cls(cfg=state_dict["cfg"], is_query=is_query)
         instance.load_state_dict(state_dict["state_dict"])
 
         return instance
 
     def get_name(self):
+        this_type = self.cfg.type_q if self.is_query else self.cfg.type_k
         transcoder_name = (
-            f"sparse_transcoder_{self.cfg.model_name}_{self.cfg.type}_{self.cfg.d_hidden}"
+            f"sparse_transcoder_{self.cfg.model_name}_{this_type}_{self.cfg.d_hidden}"
         )
         return transcoder_name
