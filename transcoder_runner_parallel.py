@@ -12,12 +12,14 @@ from transcoder_training_parallel import train_transcoder_on_language_model_para
 
 
 def language_model_transcoder_runner_parallel(cfg):
+    "Wrapper around transcoder training."
+    # Initialise model.
     model = transformer_lens.HookedTransformer.from_pretrained(cfg.model_name, fold_ln=True)
-    W_Q, b_Q = model.W_Q[cfg.layer], model.b_Q[cfg.layer]
-    W_K, b_K = model.W_K[cfg.layer], model.b_K[cfg.layer]
-    query_transcoder = SparseTranscoder(cfg, W_Q, b_Q, is_query=True)
-    key_transcoder = SparseTranscoder(cfg, W_K, b_K, is_query=False)
     activations_loader = ActivationsStore(cfg, model)
+
+    # Create transcoders.
+    query_transcoder = SparseTranscoder(cfg, is_query=True)
+    key_transcoder = SparseTranscoder(cfg, is_query=False)
 
     if cfg.log_to_wandb:
         wandb.init(entity=cfg.entity, project=cfg.wandb_project, config=cfg, name=cfg.run_name)

@@ -57,8 +57,13 @@ def train_transcoder_on_language_model_parallel(
         training_steps=total_training_steps,
         lr_end=query_transcoder.cfg.lr / 10, # heuristic for now. 
     )
-    query_transcoder.initialize_b_dec(activation_store)
-    key_transcoder.initialize_b_dec(activation_store)
+
+    # Initialisation.
+    W_Q, b_Q = model.W_Q[cfg.layer], model.b_Q[cfg.layer]
+    W_K, b_K = model.W_K[cfg.layer], model.b_K[cfg.layer]
+    query_transcoder.initialize_b_dec(activation_store, W_Q, b_Q)
+    key_transcoder.initialize_b_dec(activation_store, W_K, b_K)
+
     query_transcoder.train()
     key_transcoder.train()
     
