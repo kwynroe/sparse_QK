@@ -7,10 +7,15 @@ EXCLUDE_PATTERN="*.ipynb"
 
 # Function to perform sync
 sync_to_vast() {
-    echo "Change detected at $(date). Syncing..."
-    rsync -avz --progress --exclude="$EXCLUDE_PATTERN" "$SOURCE_DIR"/* "$DEST"
-    echo "Sync completed at $(date)"
-    echo "-------------------"
+    # Check if there are actual changes
+    changes=$(rsync -avzn --exclude="$EXCLUDE_PATTERN" "$SOURCE_DIR"/* "$DEST" 2>&1)
+
+   if echo "$changes" | grep -qvE '^(sending|receiving|$)'; then
+        echo "Changes detected at $(date). Syncing..."
+        rsync -avz --progress --exclude="$EXCLUDE_PATTERN" "$SOURCE_DIR"/* "$DEST"
+        echo "Sync completed at $(date)"
+        echo "-------------------"
+    fi
 }
 
 # Check if fswatch is installed
@@ -22,6 +27,5 @@ fi
 # Main loop
 echo "Starting sync watch on $SOURCE_DIR"
 fswatch -o "$SOURCE_DIR" | while read -r file; do
-    echo "Change detected in: $file"
     sync_to_vast
 done
