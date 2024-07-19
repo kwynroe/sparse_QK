@@ -29,23 +29,20 @@ def train_transcoder_on_language_model_parallel(
     activation_store
 ):
     print("TRAIN STARTED")
-    batch_size = cfg.batch_size
     total_training_tokens = cfg.total_training_tokens
-    total_training_steps = total_training_tokens // batch_size
+    total_training_steps = total_training_tokens // cfg.batch_size
     n_training_steps = 0
     n_training_tokens = 0
 
-    # track active features
-
-    mask = nn.Parameter(torch.ones(query_transcoder.d_hidden, key_transcoder.d_hidden, query_transcoder.n_heads))
-    optimizer = Adam(mask.parameters(), lr = cfg.lr)
     
     #define initial feature-map
     q_features = einops.rearrange(query_transcoder.W_dec, "d_hidden (n_head d_head) -> d_hidden n_head d_head", d_head = query_transcoder.d_head)
     k_features = einops.rearrange(key_transcoder.W_dec, "d_hidden (n_head d_head) -> d_hidden n_head d_head", d_head = key_transcoder.d_head)
     feature_map = einops.einsum(q_features, k_features, "d_hidden_Q n_head d_head, d_hidden_K n_head d_head -> d_hidden_Q d_hidden_K n_head")
+
+    mask = nn.Parameter(torch.ones(query_transcoder.d_hidden, key_transcoder.d_hidden, query_transcoder.n_heads))
     
-    print("gonna schedule!")
+    optimizer = Adam(mask.parameters(), lr = cfg.lr)
     scheduler = get_scheduler(
         cfg.lr_scheduler_name,
         optimizer=optimizer,
@@ -54,11 +51,9 @@ def train_transcoder_on_language_model_parallel(
         lr_end=cfg.lr / 10, # heuristic for now. 
     )
     
-    if cfg.attn_scores_norm:
-        attn_scores_norm = query_transcoder.d_head**0.5
-    else:
-        attn_scores_norm = 1
+    attn_scores_norm = cfg.d_head ** 0.5 if cfg.attn_scores_normed else 1
         
+
     pbar = tqdm(total=total_training_tokens, desc="Training SAE")
     while n_training_tokens < total_training_tokens:
         mask = torch.clip(mask, min = 0, max = 1)
@@ -101,7 +96,7 @@ def train_transcoder_on_language_model_parallel(
         reg_loss = cfg.reg_coefficient * torch.sqrt(mask.float().abs() + cfg.eps).sum()
         loss = kl_div + reg_loss
         
-        n_training_tokens += batch_size
+        n_training_tokens += cfg.batch_size
 
         with torch.no_grad():
             frac_zeros = (mask == 0).mean()
@@ -125,26 +120,12 @@ def train_transcoder_on_language_model_parallel(
             pbar.set_description(
                 f"{n_training_steps}| Loss {loss.item():.3f}"
             )
-            pbar.update(batch_size)
+            pbar.update(cfg.batch_size)
 
         loss.backward()
-        #sparse_transcoder1.remove_gradient_parallel_to_decoder_directions()
-        #sparse_transcoder2.remove_gradient_parallel_to_decoder_directions()
         optimizer.step()
 
 
-        """# checkpoint if at checkpoint frequency
-        if n_checkpoints > 0 and n_training_tokens > checkpoint_thresholds[0]:
-            cfg = sparse_transcoder1.cfg
-            path1 = f"{sparse_transcoder1.cfg.checkpoint_path}/{n_training_tokens}_{sparse_transcoder1.get_name()}.pt"
-            path2 = f"{sparse_transcoder2.cfg.checkpoint_path}/{n_training_tokens}_{sparse_transcoder2.get_name()}.pt"
-            #log_feature_sparsity_path = f"{sparse_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{sparse_transcoder.get_name()}_log_feature_sparsity.pt"
-            sparse_transcoder1.save_model(path1)
-            sparse_transcoder2.save_model(path2)
-            #torch.save(log_feature_sparsity, log_feature_sparsity_path)
-            checkpoint_thresholds.pop(0)
-            if len(checkpoint_thresholds) == 0:
-                n_checkpoints = 0"""
         
                 
             
