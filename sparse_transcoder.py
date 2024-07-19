@@ -71,7 +71,7 @@ class SparseTranscoder(HookedRootModule):
 
         self.setup()  # Required for `HookedRootModule`s
 
-    def forward(self, x, target, dead_neuron_mask=None):
+    def forward(self, x, dead_neuron_mask=None):
         # move x to correct dtype
         x = x.to(self.dtype)
         transcoder_in = self.hook_transcoder_in(
@@ -88,21 +88,16 @@ class SparseTranscoder(HookedRootModule):
         )
         feature_acts = self.hook_hidden_post(torch.nn.functional.relu(hidden_pre))
 
-        transcoder_out = einops.einsum(
+        transcoder_out = self.hook_transcoder_out(einops.einsum(
                 feature_acts,
                 self.W_dec,
                 "... d_hidden, d_hidden d_in -> ... d_in",
             ) + self.b_dec_out
+        )
         
-
-        # add config for whether l2 is normalized:
-        mse_loss = (transcoder_out - target.float()).pow(2).sum(-1).mean()
-
-        mse_loss = mse_loss.mean()
         reg_loss = self.reg_coefficient * torch.sqrt(feature_acts.float().abs() + self.eps).sum()
 
-
-        return transcoder_out, feature_acts, mse_loss, reg_loss
+        return transcoder_out, feature_acts, reg_loss
 
     @torch.no_grad()
     def initialize_b_dec(self, activation_store, model_W=None, model_b=None):

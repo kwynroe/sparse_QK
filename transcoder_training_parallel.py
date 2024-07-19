@@ -52,34 +52,28 @@ def train_transcoder_on_language_model_parallel(
     sparsity_logger = SparsityLogger(cfg)
     wandb_logger = WandbLogger(cfg, optimizer)
 
+    query_transcoder.train()
+    key_transcoder.train()
+
     with tqdm(total=total_training_tokens, desc="Training Transcoders") as pbar:
         for step in range(total_training_steps):
             
             # Do a training step.
             optimizer.zero_grad()
-            query_transcoder.train()  # TODO: think these might be redundant?
-            key_transcoder.train()
 
             # Make sure the W_dec is still zero-norm
             query_transcoder.set_decoder_norm_to_unit_norm()
             key_transcoder.set_decoder_norm_to_unit_norm()
             
+            # Get data and true values to match.
             data = activation_store.next_batch()
             data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)
-            
             true_queries, true_keys, true_scores, true_patt_view = compute_ground_truth(model, data, cfg, cfg.attn_scores_norm)
             
             # Forward transcoder passes.
-            reconstr_queries_flat, feature_actsQ, mse_lossQ, reg_lossQ = query_transcoder(
-                data,
-                flatten_heads(true_queries)    # TODO: I don't think mse and target should be in here, should use feature_acts instead
-            )
+            reconstr_queries_flat, feature_actsQ, reg_lossQ = query_transcoder(flatten_heads(true_queries))
+            reconstr_keys_flat, feature_actsK, reg_lossK = key_transcoder(flatten_heads(true_keys))
             reconstr_queries = unflatten_heads(reconstr_queries_flat, cfg.n_head)
-            
-            reconstr_keys_flat, feature_actsK,  mse_lossK, reg_lossK = key_transcoder(
-                data,
-                flatten_heads(true_keys)
-            )
             reconstr_keys = unflatten_heads(reconstr_keys_flat, cfg.n_head)
             
             #Calculate attention scores using reconstructed components (full reconstructed + half reconstructed)
@@ -102,9 +96,16 @@ def train_transcoder_on_language_model_parallel(
             # Tracking and logging things.
             pbar.update(cfg.train_batch_size)
             pbar.set_postfix({"Loss": f"{loss.item():.3f}"})
-            sparsity_logger.update(feature_actsQ, feature_actsK)  # update this every step.
+            sparsity_logger.update(feature_actsQ, feature_actsK)    # must update this every step.
 
             if cfg.log_to_wandb and (step + 1) % cfg.wandb_log_frequency == 0:
+                attn_scores_loss_full_pred = ((pred_scores_full) - (true_scores)).pow(2).mean()
+                attn_score_loss_true_keys = ((pred_scores_true_keys) - (true_scores)).pow(2).mean()
+                attn_score_loss_true_queries = ((pred_scores_true_queries) - (true_scores)).pow(2).mean()
+                patt_full_reconstr = flat_pattern_from_scores(pred_scores_full, cfg.attn_scores_norm)
+                mse_lossK = (reconstr_keys_flat - data).pow(2).sum(-1).mean().mean()
+                mse_lossQ = (reconstr_queries_flat - data).pow(2).sum(-1).mean().mean()
+
                 sparsity_logger.log_to_wandb(n_training_tokens, step)
                 wandb_logger.log_to_wandb(
                     feature_actsQ,
@@ -118,11 +119,11 @@ def train_transcoder_on_language_model_parallel(
                     patt_loss_true_keys,
                     patt_loss_true_queries,
                     patt_loss_full_pred,
-                    ((pred_scores_full) - (true_scores)).pow(2).mean(),                # attn_scores_loss_full_pred
-                    ((pred_scores_true_keys) - (true_scores)).pow(2).mean(),           # attn_score_loss_true_keys
-                    ((pred_scores_true_queries) - (true_scores)).pow(2).mean(),        # attn_score_loss_true_queries
+                    attn_scores_loss_full_pred,
+                    attn_score_loss_true_keys,
+                    attn_score_loss_true_queries,
                     true_patt_view,
-                    flat_pattern_from_scores(pred_scores_full, cfg.attn_scores_norm),  # patt_full_reconstr
+                    patt_full_reconstr,
                     step,
                 )
 
@@ -143,7 +144,7 @@ def train_transcoder_on_language_model_parallel(
 
 def compute_ground_truth(model, data, cfg, attn_scores_norm):
     """
-    Compute ground truth queries, keys, scores, and attention patterns.
+    Compute ground truth queries, keys, scores, and attention patterns (former 3 unscaled by attn_scores_norm)
 
     Args:
         model (torch.nn.Module): The main model being trained.
