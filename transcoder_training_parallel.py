@@ -14,13 +14,12 @@ from optimize import get_scheduler
 from sparse_transcoder import SparseTranscoder
 from metrics_training import WandbLogger, SparsityLogger
 
+
 def apply_causal_mask(attn_scores):
         mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)).cuda(), diagonal=1).bool()
         # Apply the mask to attention scores, then return the masked scores
         attn_scores.masked_fill_(mask, 1e-9)
         return attn_scores
-
-
 
 
 def train_transcoder_on_language_model_parallel(
@@ -62,12 +61,13 @@ def train_transcoder_on_language_model_parallel(
             optimizer.zero_grad()
 
             # Make sure the W_dec is still zero-norm
-            query_transcoder.set_decoder_norm_to_unit_norm()
-            key_transcoder.set_decoder_norm_to_unit_norm()
+            if cfg.norming_decoder_during_training:
+                query_transcoder.set_decoder_norm_to_unit_norm()
+                key_transcoder.set_decoder_norm_to_unit_norm()
             
             # Get data and true values to match.
             data = activation_store.next_batch()
-            data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)
+            data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)    # this gives batch = cfg.batch_size / cfg.context_size maybe?? - to me this seems weird??
             true_queries, true_keys, true_scores, true_patt_view = compute_ground_truth(model, data, cfg, cfg.attn_scores_norm)
             
             # Forward transcoder passes.
@@ -85,13 +85,12 @@ def train_transcoder_on_language_model_parallel(
             patt_loss_true_queries = kl_loss_scores(pred_scores_true_queries, true_patt_view, cfg.attn_scores_norm)
             patt_loss_true_keys = kl_loss_scores(pred_scores_true_keys, true_patt_view, cfg.attn_scores_norm)
             patt_loss_full_pred = kl_loss_scores(pred_scores_full, true_patt_view, cfg.attn_scores_norm)
-            loss = 3 * patt_loss_full_pred + patt_loss_true_queries + patt_loss_true_keys + reg_lossQ + reg_lossK
+            loss = 3 * patt_loss_full_pred + patt_loss_true_queries + patt_loss_true_keys + cfg.reg_coefficient * (reg_lossQ + reg_lossK)
             
             # Train step.
             loss.backward()
             optimizer.step()
             scheduler.step()
-            
 
             # Tracking and logging things.
             pbar.update(cfg.train_batch_size)
@@ -106,7 +105,6 @@ def train_transcoder_on_language_model_parallel(
                 mse_lossK = (reconstr_keys_flat - data).pow(2).sum(-1).mean().mean()
                 mse_lossQ = (reconstr_queries_flat - data).pow(2).sum(-1).mean().mean()
 
-                sparsity_logger.log_to_wandb(n_training_tokens, step)
                 wandb_logger.log_to_wandb(
                     feature_actsQ,
                     feature_actsK,
@@ -126,6 +124,7 @@ def train_transcoder_on_language_model_parallel(
                     patt_full_reconstr,
                     step,
                 )
+                sparsity_logger.log_to_wandb(n_training_tokens, step)
 
             n_training_tokens = step * cfg.train_batch_size
             if cfg.n_checkpoints > 0 and n_training_tokens > checkpoint_thresholds[0]:

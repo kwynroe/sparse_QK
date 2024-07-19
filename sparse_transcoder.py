@@ -36,7 +36,6 @@ class SparseTranscoder(HookedRootModule):
         if not isinstance(self.d_out, int):
             raise ValueError(f"d_out must be an int but was {self.d_out=}; {type(self.d_out)=}")
         self.d_hidden = cfg.d_hidden
-        self.reg_coefficient = cfg.reg_coefficient
         self.dtype = cfg.dtype
         self.device = cfg.device
         self.eps = cfg.eps
@@ -56,11 +55,8 @@ class SparseTranscoder(HookedRootModule):
                 torch.empty(self.d_hidden, self.d_out, dtype=self.dtype, device=self.device)
             )
         )
-
-        with torch.no_grad():
-            # Anthropic normalize this to have unit columns
-            self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
-
+        if cfg.norming_decoder_during_training:
+            self.set_decoder_norm_to_unit_norm()
         self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.dtype, device=self.device))
         self.b_dec_out = nn.Parameter(torch.zeros(self.d_out, dtype=self.dtype, device=self.device))
 
@@ -95,9 +91,18 @@ class SparseTranscoder(HookedRootModule):
             ) + self.b_dec_out
         )
         
-        reg_loss = self.reg_coefficient * torch.sqrt(feature_acts.float().abs() + self.eps).sum()
+        lp_norm = self.reg_loss(feature_acts)
 
-        return transcoder_out, feature_acts, reg_loss
+        return transcoder_out, feature_acts, lp_norm
+    
+
+    def reg_loss(self, feature_acts, p=0.5):
+        "Scaled regularisation term."
+        if self.cfg.norming_decoder_during_training:
+            scaled_feature_acts = feature_acts
+        else:
+            scaled_feature_acts = feature_acts * torch.norm(self.W_dec, dim=-1)
+        return torch.sqrt(scaled_feature_acts.float().abs() + self.eps).sum()    # this isnt actually the l0.5 norm, but its sqrt??
 
     @torch.no_grad()
     def initialize_b_dec(self, activation_store, model_W=None, model_b=None):

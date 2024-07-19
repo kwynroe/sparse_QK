@@ -21,14 +21,15 @@ class UnifiedConfig():
     
     # SAE Parameters
     expansion_factor: int = 12   # TODO: NOT being used??
-    d_hidden: int = 256
+    d_hidden: int = 127
     b_dec_init_method: str = "mean"
+    norming_decoder_during_training = False
     
     # Training Parameters
     lr: float = 1e-5
     reg_coefficient: float = 4e-6
     lr_scheduler_name: Optional[str] = None
-    train_batch_size: int = 512
+    train_batch_size: int = 1024
     context_size: int = 256
     lr_warm_up_steps: int = 100
     
