@@ -23,27 +23,24 @@ class SparseTranscoder(HookedRootModule):
     def __init__(
         self,
         cfg,
-        W,
-        b
+        is_query=False,
     ):
         super().__init__()
+        self.is_query = is_query
         self.cfg = cfg
         self.layer = cfg.layer
         self.d_in = cfg.d_in
         if not isinstance(self.d_in, int):
             raise ValueError(f"d_in must be an int but was {self.d_in=}; {type(self.d_in)=}")
         self.d_out = cfg.d_out
-        if not isinstance(self.d_in, int):
+        if not isinstance(self.d_out, int):
             raise ValueError(f"d_out must be an int but was {self.d_out=}; {type(self.d_out)=}")
         self.d_hidden = cfg.d_hidden
-        self.reg_coefficient = cfg.reg_coefficient
         self.dtype = cfg.dtype
         self.device = cfg.device
         self.eps = cfg.eps
         self.d_head = cfg.d_head
         self.n_head = cfg.n_head
-        self.W = W
-        self.b = b
 
         # NOTE: if using resampling neurons method, you must ensure that we initialise the weights in the order W_enc, b_enc, W_dec, b_dec
         self.W_enc = nn.Parameter(
@@ -58,11 +55,8 @@ class SparseTranscoder(HookedRootModule):
                 torch.empty(self.d_hidden, self.d_out, dtype=self.dtype, device=self.device)
             )
         )
-
-        with torch.no_grad():
-            # Anthropic normalize this to have unit columns
-            self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
-
+        if cfg.norming_decoder_during_training:
+            self.set_decoder_norm_to_unit_norm()
         self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.dtype, device=self.device))
         self.b_dec_out = nn.Parameter(torch.zeros(self.d_out, dtype=self.dtype, device=self.device))
 
@@ -73,7 +67,7 @@ class SparseTranscoder(HookedRootModule):
 
         self.setup()  # Required for `HookedRootModule`s
 
-    def forward(self, x, target, dead_neuron_mask=None):
+    def forward(self, x, dead_neuron_mask=None):
         # move x to correct dtype
         x = x.to(self.dtype)
         transcoder_in = self.hook_transcoder_in(
@@ -90,27 +84,33 @@ class SparseTranscoder(HookedRootModule):
         )
         feature_acts = self.hook_hidden_post(torch.nn.functional.relu(hidden_pre))
 
-        transcoder_out = einops.einsum(
+        transcoder_out = self.hook_transcoder_out(einops.einsum(
                 feature_acts,
                 self.W_dec,
                 "... d_hidden, d_hidden d_in -> ... d_in",
             ) + self.b_dec_out
+        )
         
+        lp_norm = self.reg_loss(feature_acts)
 
-        # add config for whether l2 is normalized:
-        mse_loss = (transcoder_out - target.float()).pow(2).sum(-1).mean()
+        return transcoder_out, feature_acts, lp_norm
+    
 
-        mse_loss = mse_loss.mean()
-        reg_loss = self.reg_coefficient * torch.sqrt(feature_acts.float().abs() + self.eps).sum()
-
-
-        return transcoder_out, feature_acts, mse_loss, reg_loss
+    def reg_loss(self, feature_acts, p=0.5):
+        "Scaled regularisation term."
+        if self.cfg.norming_decoder_during_training:
+            scaled_feature_acts = feature_acts
+        else:
+            scaled_feature_acts = feature_acts * torch.norm(self.W_dec, dim=-1)
+        return torch.sqrt(scaled_feature_acts.float().abs() + self.eps).sum()    # this isnt actually the l0.5 norm, but its sqrt??
 
     @torch.no_grad()
-    def initialize_b_dec(self, activation_store):
+    def initialize_b_dec(self, activation_store, model_W=None, model_b=None):
         if self.cfg.b_dec_init_method == "mean":
+            if model_W is None or model_b is None:
+                raise ValueError("Model weights required for mean initialisation in initialise_b_dec.")
             self.initialize_b_dec_with_mean(activation_store)
-            self.initialize_b_dec_out_with_mean(activation_store)
+            self.initialize_b_dec_out_with_mean(activation_store, model_W, model_b)
         elif self.cfg.b_dec_init_method == "zeros":
             pass
         else:
@@ -134,11 +134,11 @@ class SparseTranscoder(HookedRootModule):
         self.b_dec.data = out.to(self.dtype).to(self.device)
 
     @torch.no_grad()
-    def initialize_b_dec_out_with_mean(self, activation_store):
+    def initialize_b_dec_out_with_mean(self, activation_store, model_W, model_b):
 
         previous_b_dec_out = self.b_dec_out.clone().cpu()
         all_activations = activation_store.storage_buffer.detach()
-        all_activations = einops.einsum(all_activations, self.W, "... d_model, n_head d_model d_head -> ... n_head d_head") + self.b
+        all_activations = einops.einsum(all_activations, model_W, "... d_model, n_head d_model d_head -> ... n_head d_head") + model_b
         all_activations = einops.rearrange(all_activations, "... n_head d_head -> ... (n_head d_head)")
         all_activations = all_activations.cpu()
         out = all_activations.mean(dim=0)
@@ -158,8 +158,8 @@ class SparseTranscoder(HookedRootModule):
         A method for running the model with the Transcoder activations in order to return the loss.
         returns per token loss when activations are substituted in.
         """
-        input_hook = self.cfg.hook_transcoder_in
-        target_hook = self.cfg.hook_transcoder_out
+        input_hook = self.cfg.hook_transcoder_in_q if self.is_query else self.cfg.hook_transcoder_in_k
+        target_hook = self.cfg.hook_transcoder_out_q if self.is_query else self.cfg.hook_transcoder_out_k
 
         comp_cache = None
 
@@ -227,7 +227,7 @@ class SparseTranscoder(HookedRootModule):
         print(f"Saved model to {path}")
 
     @classmethod
-    def load_from_pretrained(cls, path: str):
+    def load_from_pretrained(cls, path: str, is_query=True):
         """
         Load function for the model. Loads the model's state_dict and the config used to train it.
         This method can be called directly on the class, without needing an instance.
@@ -270,13 +270,14 @@ class SparseTranscoder(HookedRootModule):
             raise ValueError("The loaded state dictionary must contain 'cfg' and 'state_dict' keys")
 
         # Create an instance of the class using the loaded configuration
-        instance = cls(cfg=state_dict["cfg"])
+        instance = cls(cfg=state_dict["cfg"], is_query=is_query)
         instance.load_state_dict(state_dict["state_dict"])
 
         return instance
 
     def get_name(self):
+        this_type = self.cfg.type_q if self.is_query else self.cfg.type_k
         transcoder_name = (
-            f"sparse_transcoder_{self.cfg.model_name}_{self.cfg.type}_{self.cfg.d_hidden}"
+            f"sparse_transcoder_{self.cfg.model_name}_{this_type}_{self.cfg.d_hidden}"
         )
         return transcoder_name

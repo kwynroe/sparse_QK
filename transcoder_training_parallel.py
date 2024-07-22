@@ -12,6 +12,8 @@ import wandb
 from ActivationStoreParallel import ActivationsStore
 from optimize import get_scheduler
 from sparse_transcoder import SparseTranscoder
+from metrics_training import WandbLogger, SparsityLogger
+
 
 def apply_causal_mask(attn_scores):
         mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)).cuda(), diagonal=1).bool()
@@ -26,231 +28,154 @@ def train_transcoder_on_language_model_parallel(
     query_transcoder: SparseTranscoder,
     key_transcoder: SparseTranscoder,
     activation_store: ActivationsStore,
-    batch_size: int = 1024,
-    n_checkpoints: int = 0,
-    feature_sampling_method = None,
-    use_wandb: bool = True,
-    wandb_log_frequency: int = 1,
 ):
-    print("TRAIN STARTED")
-    if feature_sampling_method is not None:
-        feature_sampling_method = feature_sampling_method.lower()
+    print("Initialising...")
+    total_training_tokens = cfg.total_training_tokens
+    total_training_steps = total_training_tokens // cfg.train_batch_size
 
-    total_training_tokens = query_transcoder.cfg.total_training_tokens
-    total_training_steps = total_training_tokens // batch_size
-    n_training_steps = 0
-    n_training_tokens = 0
-    if n_checkpoints > 0:
-        checkpoint_thresholds = list(range(0, total_training_tokens, total_training_tokens // n_checkpoints))[1:]
+    if cfg.n_checkpoints > 0:
+        checkpoint_thresholds = list(range(0, total_training_tokens, total_training_tokens // cfg.n_checkpoints))[1:]
     
-    # track active features
-    act_freq_scores1 = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
-    act_freq_scores2 = torch.zeros(key_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
-    n_forward_passes_since_fired1 = torch.zeros(query_transcoder.cfg.d_hidden, device=query_transcoder.cfg.device)
-    n_forward_passes_since_fired2 = torch.zeros(key_transcoder.cfg.d_hidden, device=key_transcoder.cfg.device)
-    n_frac_active_tokens = 0
-    
-    optimizer = Adam(list(query_transcoder.parameters()) + list(key_transcoder.parameters()),
-                     lr = query_transcoder.cfg.lr)
-    print("gonna schedule!")
-    scheduler = get_scheduler(
-        query_transcoder.cfg.lr_scheduler_name,
-        optimizer=optimizer,
-        warm_up_steps = query_transcoder.cfg.lr_warm_up_steps, 
-        training_steps=total_training_steps,
-        lr_end=query_transcoder.cfg.lr / 10, # heuristic for now. 
+    optimizer = Adam(
+        list(query_transcoder.parameters()) + list(key_transcoder.parameters()),
+        lr=cfg.lr
     )
-    query_transcoder.initialize_b_dec(activation_store)
-    key_transcoder.initialize_b_dec(activation_store)
+    scheduler = get_scheduler(
+        cfg.lr_scheduler_name,
+        optimizer=optimizer,
+        warm_up_steps=cfg.lr_warm_up_steps, 
+        training_steps=total_training_tokens // cfg.train_batch_size,
+        lr_end=cfg.lr / 10, # heuristic for now. 
+    )
+
+    sparsity_logger = SparsityLogger(cfg)
+    wandb_logger = WandbLogger(cfg, optimizer)
+
     query_transcoder.train()
     key_transcoder.train()
-    
-    if query_transcoder.cfg.attn_scores_normed:
-        attn_scores_norm = query_transcoder.d_head**0.5
-    else:
-        attn_scores_norm = 1
-    print("gonna progress bar!")
-    pbar = tqdm(total=total_training_tokens, desc="Training SAE")
-    while n_training_tokens < total_training_tokens:
-        
-        # Do a training step.
-        query_transcoder.train()
-        key_transcoder.train()
-        # Make sure the W_dec is still zero-norm
-        query_transcoder.set_decoder_norm_to_unit_norm()
-        key_transcoder.set_decoder_norm_to_unit_norm()
-           
-        scheduler.step()
-        optimizer.zero_grad()
-        
-        data = activation_store.next_batch()
-        data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)
-        
-        #ground truth activations for loss
-        true_queries = einops.einsum(model.W_Q[query_transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_Q[query_transcoder.layer]
-        true_keys = einops.einsum(model.W_K[query_transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_K[query_transcoder.layer]
-        true_scores = einops.einsum(true_queries, true_keys, " ... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")/attn_scores_norm
-        true_patt = apply_causal_mask(true_scores).log_softmax(-1)
-        
-        true_queries_flatt = einops.rearrange(true_queries, " ... n_head d_head -> ... (n_head d_head)")
-        true_keys_flatt = einops.rearrange(true_keys, " ... n_head d_head -> ... (n_head d_head)")
-        
-        
-        # Forward and Backward Passes
-        reconstr_queries, feature_actsQ, mse_lossQ, reg_lossQ= query_transcoder(
-            data,
-            true_queries_flatt
-        )
-        
-        reconstr_keys, feature_actsK,  mse_lossK, reg_lossK = key_transcoder(
-            data,
-            true_keys_flatt
-        )
-        
-        reconstr_queries = einops.rearrange(reconstr_queries, " ... (n_head d_head) -> ... n_head d_head", n_head = 12)
-        reconstr_keys = einops.rearrange(reconstr_keys, " ... (n_head d_head) -> ... n_head d_head", n_head = 12)
-        
-        #Calculate attention scores using reconstructed components (full reconstructed + half reconstructed)
-        pred_attn_scores_true_keys = einops.einsum(reconstr_queries, true_keys, " ... posnq n_head d_head, ... posnk n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
-        pred_attn_scores_true_queries = einops.einsum(reconstr_keys, true_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
-        full_pred_attn_scores = einops.einsum(reconstr_keys, reconstr_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")/attn_scores_norm
-        
-        #Error on attention scores
-        attn_score_loss_true_keys = ((pred_attn_scores_true_keys) - (true_scores)).pow(2).mean()
-        attn_score_loss_true_queries = ((pred_attn_scores_true_queries) - (true_scores)).pow(2).mean()
-        attn_scores_loss_full_pred = ((full_pred_attn_scores) - (true_scores)).pow(2).mean()
-        patt_true_keys = apply_causal_mask(pred_attn_scores_true_keys).log_softmax(-1)
-        patt_true_queries = apply_causal_mask(pred_attn_scores_true_queries).log_softmax(-1)
-        patt_full_reconstr = apply_causal_mask(full_pred_attn_scores).log_softmax(-1)                              
 
-        #Reshape patterns and compute KL-Divergences for loss
-        kl_loss = torch.nn.KLDivLoss(reduction="batchmean", log_target = True)
-        true_patt_flat = true_patt.view((-1, true_patt.shape[-1]))
-        patt_full_reconstr = patt_full_reconstr.view((-1, patt_full_reconstr.shape[-1]))
-        patt_true_keys = patt_true_keys.view((-1, patt_true_keys.shape[-1]))
-        patt_true_queries = patt_true_queries.view((-1, patt_true_queries.shape[-1]))
-        
-        patt_loss_true_queries = kl_loss(patt_true_queries, true_patt_flat)
-        patt_loss_true_keys = kl_loss(patt_true_keys, true_patt_flat)
-        patt_loss_full_pred = kl_loss(patt_full_reconstr, true_patt_flat)
-        
-        #Calculate average max pattern error and fraction of contexts where reconstruction correctly identified most interesting source token
-        #Not very rigorous but helpful to plot while training!
-        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr))), dim = -1).values.mean()
-        frac_accurate = (torch.argmax(patt_full_reconstr, dim = -1) == torch.argmax(true_patt_flat, dim = -1)).float().mean()
-        
-        #Full loss
-        loss = 3*patt_loss_full_pred + patt_loss_true_queries + patt_loss_true_keys + reg_lossQ + reg_lossK
-        
-        #Feature Sparsity Calculations
-        did_fireQ = ((feature_actsQ > 0).float().sum(0).sum(0) > 0)
-        did_fireK = ((feature_actsK > 0).float().sum(0).sum(0) > 0)
-        n_forward_passes_since_fired1 += 1
-        n_forward_passes_since_fired1[did_fireQ] = 0
-        n_forward_passes_since_fired2 += 1
-        n_forward_passes_since_fired2[did_fireK] = 0
-        n_training_tokens += batch_size
-
-        with torch.no_grad():
-            # Calculate the sparsities, and add it to a list, calculate sparsity metrics
-            act_freq_scores1 += (feature_actsQ.abs() > 0).float().sum(0).sum(0)
-            act_freq_scores2 += (feature_actsK.abs() > 0).float().sum(0).sum(0)
-            n_frac_active_tokens += batch_size
-            feature_sparsity1 = act_freq_scores1 / n_frac_active_tokens
-            feature_sparsity2 = act_freq_scores2 / n_frac_active_tokens
-            l0_Q = (feature_actsQ > 0).float().sum(-1).mean()
-            l0_K = (feature_actsK > 0).float().sum(-1).mean()
-            current_learning_rate = optimizer.param_groups[0]["lr"]
-                
-            #per_token_l2_loss = (transcoder_out - target).pow(2).sum(dim=-1).squeeze()
-            total_variance = (true_scores - true_scores.mean()).pow(2).mean()
+    with tqdm(total=total_training_tokens, desc="Training Transcoders") as pbar:
+        for step in range(total_training_steps):
             
-            resid_var_q = (true_scores - pred_attn_scores_true_keys).pow(2).mean()
-            resid_var_k = (true_scores - pred_attn_scores_true_queries).pow(2).mean()
-            explained_var_q = 1 - resid_var_q / total_variance
-            explained_var_k = 1 - resid_var_k / total_variance
+            # Do a training step.
+            optimizer.zero_grad()
+
+            # Make sure the W_dec is still zero-norm
+            if cfg.norming_decoder_during_training:
+                query_transcoder.set_decoder_norm_to_unit_norm()
+                key_transcoder.set_decoder_norm_to_unit_norm()
             
-            if use_wandb:
-                if (n_training_steps + 1) % wandb_log_frequency == 0:
-                    wandb.log(
-                            {
-                                # losses
-                                "losses/mse_lossQ": mse_lossQ.item(),
-                                "losses/mse_lossK": mse_lossK.item(),
-                                "losses/reg_lossQ": reg_lossQ.item(),
-                                "losses/reg_lossK": reg_lossK.item(),
-                                "losses/patt_lossQ": patt_loss_true_keys.item(),
-                                "losses/patt_lossK": patt_loss_true_queries.item(),
-                                "losses/patt_loss_full": patt_loss_full_pred.item(),
-                                
-                                # metrics
-                                "metrics/full_pred_diff": attn_scores_loss_full_pred.item(),
-                                "metrics/loss_true_keys": attn_score_loss_true_keys.item(),
-                                "metrics/loss_true_queries": attn_score_loss_true_queries.item(),
-                                "metrics/l0_Q": l0_Q.item(),
-                                "metrics/l0_K": l0_K.item(),
+            # Get data and true values to match.
+            data = activation_store.next_batch()
+            data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)    # this gives batch = cfg.batch_size / cfg.context_size maybe?? - to me this seems weird??
+            true_queries, true_keys, true_scores, true_patt_view = compute_ground_truth(model, data, cfg, cfg.attn_scores_norm)
+            
+            # Forward transcoder passes.
+            reconstr_queries_flat, feature_actsQ, reg_lossQ = query_transcoder(flatten_heads(true_queries))
+            reconstr_keys_flat, feature_actsK, reg_lossK = key_transcoder(flatten_heads(true_keys))
+            reconstr_queries = unflatten_heads(reconstr_queries_flat, cfg.n_head)
+            reconstr_keys = unflatten_heads(reconstr_keys_flat, cfg.n_head)
+            
+            #Calculate attention scores using reconstructed components (full reconstructed + half reconstructed)
+            pred_scores_true_keys = einops.einsum(reconstr_queries, true_keys, " ... posnq n_head d_head, ... posnk n_head d_head -> ... n_head posnq posnk")
+            pred_scores_true_queries = einops.einsum(reconstr_keys, true_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")
+            pred_scores_full = einops.einsum(reconstr_keys, reconstr_queries, " ... posnk n_head d_head, ... posnq n_head d_head -> ... n_head posnq posnk")
+            
+            # Losses with full + half reconstructions
+            patt_loss_true_queries = kl_loss_scores(pred_scores_true_queries, true_patt_view, cfg.attn_scores_norm)
+            patt_loss_true_keys = kl_loss_scores(pred_scores_true_keys, true_patt_view, cfg.attn_scores_norm)
+            patt_loss_full_pred = kl_loss_scores(pred_scores_full, true_patt_view, cfg.attn_scores_norm)
+            loss = 3 * patt_loss_full_pred + patt_loss_true_queries + patt_loss_true_keys + cfg.reg_coefficient * (reg_lossQ + reg_lossK)
+            
+            # Train step.
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
 
-                                # sparsity
-                                "sparsity/below_1e-5_Q": (feature_sparsity1 < 1e-5)
-                                .float()
-                                .mean()
-                                .item(),
-                                "sparsity/above_1e-1_K": (feature_sparsity1 > 1e-1)
-                                .float()
-                                .mean()
-                                .item(),
-                                "sparsity/above_1e-1_Q": (feature_sparsity2 > 1e-1)
-                                .float()
-                                .mean()
-                                .item(),
-                                "sparsity/below_1e-5_K": (feature_sparsity2 < 1e-5)
-                                .float()
-                                .mean()
-                                .item(),
-                                "sparsity/avg_log_freq_K": (torch.log10(feature_sparsity2).mean())
-                                .float()
-                                .mean()
-                                .item(),
-                                "sparsity/avg_log_freq_Q": (torch.log10(feature_sparsity1).mean())
-                                .float()
-                                .mean()
-                                .item(),
-                                
-                                #misc details
-                                "details/n_training_tokens": n_training_tokens,
-                                "details/pred_key_mean": reconstr_keys.mean().item(),
-                                "details/pred_query_mean": reconstr_queries.mean().item(),
-                                "details/patt_max_diff": patt_max_diff.item(),
-                                "details/frac_acc": frac_accurate.item(),
-                                "details/lr": current_learning_rate
+            # Tracking and logging things.
+            pbar.update(cfg.train_batch_size)
+            pbar.set_postfix({"Loss": f"{loss.item():.3f}"})
+            sparsity_logger.update(feature_actsQ, feature_actsK)    # must update this every step.
 
-                            },
-                            step=n_training_steps,
-                    )
-            pbar.set_description(
-                f"{n_training_steps}| MSE Loss {loss.item():.3f}"
-            )
-            pbar.update(batch_size)
+            if cfg.log_to_wandb and (step + 1) % cfg.wandb_log_frequency == 0:
+                attn_scores_loss_full_pred = ((pred_scores_full) - (true_scores)).pow(2).mean()
+                attn_score_loss_true_keys = ((pred_scores_true_keys) - (true_scores)).pow(2).mean()
+                attn_score_loss_true_queries = ((pred_scores_true_queries) - (true_scores)).pow(2).mean()
+                patt_full_reconstr = flat_pattern_from_scores(pred_scores_full, cfg.attn_scores_norm)
+                mse_lossK = (reconstr_keys_flat - data).pow(2).sum(-1).mean().mean()
+                mse_lossQ = (reconstr_queries_flat - data).pow(2).sum(-1).mean().mean()
 
-        loss.backward()
-        #query_transcoder.remove_gradient_parallel_to_decoder_directions()
-        #key_transcoder.remove_gradient_parallel_to_decoder_directions()
-        optimizer.step()
+                wandb_logger.log_to_wandb(
+                    feature_actsQ,
+                    feature_actsK,
+                    mse_lossQ,
+                    mse_lossK,
+                    reg_lossQ,
+                    reg_lossK,
+                    reconstr_keys,
+                    reconstr_queries,
+                    patt_loss_true_keys,
+                    patt_loss_true_queries,
+                    patt_loss_full_pred,
+                    attn_scores_loss_full_pred,
+                    attn_score_loss_true_keys,
+                    attn_score_loss_true_queries,
+                    true_patt_view,
+                    patt_full_reconstr,
+                    step,
+                )
+                sparsity_logger.log_to_wandb(n_training_tokens, step)
 
-
-        # checkpoint if at checkpoint frequency
-        if n_checkpoints > 0 and n_training_tokens > checkpoint_thresholds[0]:
-            cfg = query_transcoder.cfg
-            path1 = f"{query_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{query_transcoder.get_name()}.pt"
-            path2 = f"{key_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{key_transcoder.get_name()}.pt"
-            #log_feature_sparsity_path = f"{sparse_transcoder.cfg.checkpoint_path}/{n_training_tokens}_{sparse_transcoder.get_name()}_log_feature_sparsity.pt"
-            query_transcoder.save_model(path1)
-            key_transcoder.save_model(path2)
-            #torch.save(log_feature_sparsity, log_feature_sparsity_path)
-            checkpoint_thresholds.pop(0)
-            if len(checkpoint_thresholds) == 0:
-                n_checkpoints = 0        
-        n_training_steps += 1
+            n_training_tokens = step * cfg.train_batch_size
+            if cfg.n_checkpoints > 0 and n_training_tokens > checkpoint_thresholds[0]:
+                path_q = f"{cfg.checkpoint_path}/{n_training_tokens}_{query_transcoder.get_name()}.pt"
+                path_k = f"{cfg.checkpoint_path}/{n_training_tokens}_{key_transcoder.get_name()}.pt"
+                query_transcoder.save_model(path_q)
+                key_transcoder.save_model(path_k)
+                checkpoint_thresholds.pop(0)
+                if len(checkpoint_thresholds) == 0:
+                    cfg.n_checkpoints = 0        
 
     return query_transcoder, key_transcoder
 
+
+
+
+def compute_ground_truth(model, data, cfg, attn_scores_norm):
+    """
+    Compute ground truth queries, keys, scores, and attention patterns (former 3 unscaled by attn_scores_norm)
+
+    Args:
+        model (torch.nn.Module): The main model being trained.
+        data (torch.Tensor): Input data tensor.
+        cfg (Config): Configuration object containing model parameters.
+        attn_scores_norm: Either 1 or 1/sqrt(d_head)
+
+    Returns:
+        tuple: Contains true_queries, true_keys, true_scores, and true_patt tensors.
+    """
+    true_queries = einops.einsum(model.W_Q[cfg.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_Q[cfg.layer]
+    true_keys = einops.einsum(model.W_K[cfg.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_K[cfg.layer]
+    true_scores = einops.einsum(true_queries, true_keys, "... posn_q n_head d_head, ... posn_k n_head d_head -> ... n_head posn_q posn_k")
+    true_patt_view = flat_pattern_from_scores(true_scores, attn_scores_norm)
+    return true_queries, true_keys, true_scores, true_patt_view
+
+
+def flatten_heads(tensor):
+    return einops.rearrange(tensor, " ... n_head d_head -> ... (n_head d_head)")
+
+def unflatten_heads(tensor, n_head):
+    return einops.rearrange(tensor, " ... (n_head d_head) -> ... n_head d_head", n_head=n_head)
+
+
+def flat_pattern_from_scores(scores, attn_scores_norm):
+    pattern = apply_causal_mask(scores / attn_scores_norm).log_softmax(-1)
+    flat_pattern = pattern.view((-1, pattern.shape[-1]))
+    return flat_pattern
+
+
+def kl_loss_scores(predicted_scores, true_patt_view, attn_scores_norm):
+    "Takes in non-flattened scores and pattern and gives kl loss."
+    pred_patt_flat = flat_pattern_from_scores(predicted_scores, attn_scores_norm)
+    kl_loss = torch.nn.KLDivLoss(reduction="batchmean", log_target = True)  # TODO could probably use scores instead??
+    return kl_loss(pred_patt_flat, true_patt_view)
