@@ -66,13 +66,18 @@ def train_transcoder_on_language_model_parallel(
                 key_transcoder.set_decoder_norm_to_unit_norm()
             
             # Get data and true values to match.
-            data = activation_store.next_batch()
-            data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)    # this gives batch = cfg.batch_size / cfg.context_size maybe?? - to me this seems weird??
-            true_queries, true_keys, true_scores, true_patt_view = compute_ground_truth(model, data, cfg, cfg.attn_scores_norm)
+            resid = activation_store.next_batch()
+            resid = einops.rearrange(resid, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)    # this gives batch = cfg.batch_size / cfg.context_size maybe?? - to me this seems weird??
+            true_queries, true_keys, true_scores, true_patt_view = compute_ground_truth(model, resid, cfg, cfg.attn_scores_norm)
             
             # Forward transcoder passes.
-            reconstr_queries_flat, feature_actsQ, reg_lossQ = query_transcoder(flatten_heads(true_queries))
-            reconstr_keys_flat, feature_actsK, reg_lossK = key_transcoder(flatten_heads(true_keys))
+            if cfg.as_sae:
+                key_trans_in = flatten_heads(true_keys)
+                query_trans_in = flatten_heads(true_queries)
+            else:
+                key_trans_in, query_trans_in = resid, resid
+            reconstr_queries_flat, feature_actsQ, reg_lossQ = query_transcoder(query_trans_in)
+            reconstr_keys_flat, feature_actsK, reg_lossK = key_transcoder(key_trans_in)
             reconstr_queries = unflatten_heads(reconstr_queries_flat, cfg.n_head)
             reconstr_keys = unflatten_heads(reconstr_keys_flat, cfg.n_head)
             
@@ -102,8 +107,8 @@ def train_transcoder_on_language_model_parallel(
                 attn_score_loss_true_keys = ((pred_scores_true_keys) - (true_scores)).pow(2).mean()
                 attn_score_loss_true_queries = ((pred_scores_true_queries) - (true_scores)).pow(2).mean()
                 patt_full_reconstr = flat_pattern_from_scores(pred_scores_full, cfg.attn_scores_norm)
-                mse_lossK = (reconstr_keys_flat - data).pow(2).sum(-1).mean().mean()
-                mse_lossQ = (reconstr_queries_flat - data).pow(2).sum(-1).mean().mean()
+                mse_lossK = (reconstr_keys_flat - flatten_heads(true_keys)).pow(2).sum(-1).mean().mean()
+                mse_lossQ = (reconstr_queries_flat - flatten_heads(true_queries)).pow(2).sum(-1).mean().mean()
 
                 wandb_logger.log_to_wandb(
                     feature_actsQ,
