@@ -13,12 +13,18 @@ from ActivationStoreParallel import ActivationsStore
 from optimize import get_scheduler
 from sparse_transcoder import SparseTranscoder
 
+def apply_causal_mask(attn_scores):
+        mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)).cuda(), diagonal=1).bool()
+        # Apply the mask to attention scores, then return the masked scores
+        attn_scores.masked_fill_(mask, -1e9)
+        return attn_scores
 
 
 def train_OV_transcoder(
     cfg,
     model: HookedTransformer,
     transcoder,
+    key_transcoder,
     activation_store: ActivationsStore,
     batch_size: int = 1024,
     n_checkpoints: int = 0,
@@ -55,6 +61,11 @@ def train_OV_transcoder(
     transcoder.initialize_b_dec(activation_store)
     transcoder.train()
     
+    
+    if cfg.attn_scores_norm:
+        attn_scores_norm = transcoder.d_head ** 0.5
+    else:
+        attn_scores_norm = 1
     print("gonna progress bar!")
     pbar = tqdm(total=total_training_tokens, desc="Training SAE")
     while n_training_tokens < total_training_tokens:
@@ -68,24 +79,32 @@ def train_OV_transcoder(
         optimizer.zero_grad()
         
         data = activation_store.next_batch()
-        data = einops.rearrange(data, "batch posn d_model -> batch posn d_model", posn = cfg.context_size)
-        
-        V = einops.einsum(model.W_V[transcoder.layer], data, "d_model n_head d_head, ... d_model -> ... n_head d_head") + model.b_V[transcoder.layer]
+        data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)
+        V = einops.einsum(model.W_V[transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_V[transcoder.layer]
         post = einops.einsum(V, model.W_O[transcoder.layer], "... n_head d_head, n_head d_head d_model -> ... n_head d_model") + model.b_O[transcoder.layer] 
-        post = einops.rearrange(post, "... n_head d_model -> ... (n_head d_model)")
+        
         
         #ground truth activations for loss
-
+        true_keys = einops.einsum(model.W_K[transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_K[transcoder.layer]
+        true_queries = einops.einsum(model.W_Q[transcoder.layer], data, "n_head d_model d_head, ... d_model -> ... n_head d_head") + model.b_Q[transcoder.layer]
+        true_scores = einops.einsum(true_queries, true_keys, "batch posnQ n_head d_head, batch posnK n_head d_head -> batch n_head posnQ posnK")/attn_scores_norm
+        true_patt = apply_causal_mask(true_scores).softmax(-1)
+        attn_out = einops.einsum(post, true_patt, "batch posnK n_head d_model, batch n_head posnQ posnK -> batch posnQ n_head d_model")
+        attn_out = einops.rearrange(attn_out, "... n_head d_head -> ... (n_head d_head)")
+        _, feature_actsK, _ = key_transcoder(data)
+        
         # Forward and Backward Passes
-        reconstr_post, feature_acts, mse_loss, reg_loss = transcoder(
+        reconstr_post, feature_acts, reg_loss, gamma_reg_loss = transcoder(
             data,
-            post
+            feature_actsK,
+            true_patt
         )
         
+        mse_loss = (reconstr_post - attn_out).pow(2).sum(-1).mean()
         
     
         #Full loss
-        loss = mse_loss + reg_loss
+        loss = mse_loss + cfg.reg_coefficient*reg_loss + cfg.gamma_reg_coefficient*gamma_reg_loss
         
         #Feature Sparsity Calculations
         did_fireQ = ((feature_acts > 0).float().sum(0).sum(0) > 0)
@@ -105,9 +124,9 @@ def train_OV_transcoder(
             current_learning_rate = optimizer.param_groups[0]["lr"]
                 
             #per_token_l2_loss = (transcoder_out - target).pow(2).sum(dim=-1).squeeze()
-            total_variance = (post - post.mean()).pow(2).mean()
+            total_variance = (attn_out - attn_out.mean()).pow(2).mean()
             
-            resid_var = (post - reconstr_post).pow(2).mean()
+            resid_var = (attn_out - reconstr_post).pow(2).mean()
             explained_var = 1 - resid_var / total_variance
 
             
@@ -119,12 +138,16 @@ def train_OV_transcoder(
                                 "losses/mse_loss": mse_loss.item(),
                 
                                 "losses/reg_loss": reg_loss.item(),
+                                
+                                "losses/gamma_reg_loss": gamma_reg_loss.item(),
                      
                 
                                 # metrics
        
                                 "metrics/l0_Q": l0.item(),
                                 "metrics/explained_var": explained_var.item(),
+                                "metrics/gamma_zeros": (transcoder.gamma == 0).float().mean().item(),
+                                "metrics/gamma_decreasing":(transcoder.gamma < 0.9).float().mean().item(),
 
                                 # sparsity
                                 "sparsity/below_1e-5": (feature_sparsity1 < 1e-5)
@@ -157,6 +180,9 @@ def train_OV_transcoder(
         #transcoder.remove_gradient_parallel_to_decoder_directions()
         #key_transcoder.remove_gradient_parallel_to_decoder_directions()
         optimizer.step()
+        
+        with torch.no_grad():
+           transcoder.gamma.clamp_(0, 1)
 
 
         # checkpoint if at checkpoint frequency

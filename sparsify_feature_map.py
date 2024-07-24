@@ -40,7 +40,6 @@ def train_mask(
     #define initial feature-map
     q_features = einops.rearrange(query_transcoder.W_dec, "d_hidden (n_head d_head) -> d_hidden n_head d_head", d_head = query_transcoder.d_head)
     k_features = einops.rearrange(key_transcoder.W_dec, "d_hidden (n_head d_head) -> d_hidden n_head d_head", d_head = key_transcoder.d_head)
-    feature_map_base = einops.einsum(q_features, k_features, "d_hidden_Q n_head d_head, d_hidden_K n_head d_head -> d_hidden_Q d_hidden_K n_head")
 
     mask = nn.Parameter(torch.ones(query_transcoder.d_hidden, key_transcoder.d_hidden, query_transcoder.n_head).cuda())
     
@@ -58,7 +57,7 @@ def train_mask(
 
     pbar = tqdm(total=total_training_tokens, desc="Training SAE")
     while n_training_tokens < total_training_tokens:
-        
+        optimizer.zero_grad()  
         data = activation_store.next_batch()
         data = einops.rearrange(data, "(batch posn) d_model -> batch posn d_model", posn = cfg.context_size)
         
@@ -75,15 +74,15 @@ def train_mask(
         feature_map = feature_map * mask
         
         #feature activations
-        feature_acts_Q = F.relu(einops.einsum((true_queries_flat - query_transcoder.b_dec), query_transcoder.W_enc, "... d_model, d_model d_hidden -> ... d_hidden") + query_transcoder.b_enc)
-        feature_acts_K = F.relu(einops.einsum((true_keys_flat - key_transcoder.b_dec), key_transcoder.W_enc, "... d_model, d_model d_hidden -> ... d_hidden") + key_transcoder.b_enc)
+        feature_acts_Q = F.relu(einops.einsum((data - query_transcoder.b_dec), query_transcoder.W_enc, "... d_model, d_model d_hidden -> ... d_hidden") + query_transcoder.b_enc)
+        feature_acts_K = F.relu(einops.einsum((data - key_transcoder.b_dec), key_transcoder.W_enc, "... d_model, d_model d_hidden -> ... d_hidden") + key_transcoder.b_enc)
         #given feature acts and map between features, compute attention contribution from feature-pairs
         attn_contribution = einops.einsum(feature_acts_Q, feature_map, "batch posnQ d_hidden_Q, d_hidden_Q d_hidden_K n_head -> batch posnQ d_hidden_K n_head")
 
         attn_contribution = einops.einsum(attn_contribution, feature_acts_K, "batch posnQ d_hidden_K n_head, batch posnK d_hidden_K -> batch posnQ posnK n_head")
         
         #compute attention contribution from key-features to query-biase 
-        bias_reshape = einops.rearrange(query_transcoder.b_dec, "(n_head d_head) -> n_head d_head", n_head = cfg.n_head)
+        bias_reshape = einops.rearrange(query_transcoder.b_dec_out, "(n_head d_head) -> n_head d_head", n_head = cfg.n_head)
         bias_acts = einops.einsum(k_features, bias_reshape, "d_hidden_K n_head d_head, n_head d_head -> n_head d_hidden_K")
         contr_from_bias = einops.einsum(bias_acts, feature_acts_K, "n_head d_hidden_K, ... d_hidden_K -> ... n_head").unsqueeze(1)
         #pattern and loss
@@ -93,7 +92,6 @@ def train_mask(
         true_patt_flat = true_patt.view((-1, true_patt.shape[-1]))
         reconstr_patt = reconstr_patt.view((-1, reconstr_patt.shape[-1]))
         kl = torch.nn.KLDivLoss(reduction = "batchmean", log_target = True)
-        print(reconstr_patt.shape, true_patt_flat.shape)
         kl_div = kl(reconstr_patt, true_patt_flat)
         reg_loss = cfg.reg_coefficient * torch.sqrt(mask.float().abs() + cfg.eps).sum()
         loss = kl_div + reg_loss
@@ -101,6 +99,7 @@ def train_mask(
         n_training_tokens += cfg.batch_size
 
         with torch.no_grad():
+            
             frac_zeros = (mask == 0).float().mean()
             frac_below_half = (mask < 0.5).float().mean()
             frac_decreasing = (mask < 0.9).float().mean()
@@ -136,7 +135,7 @@ def train_mask(
             pbar.update(cfg.batch_size)
 
 
-        optimizer.zero_grad()  # Ensure gradients are zeroed before backward pass
+        # Ensure gradients are zeroed before backward pass
         loss.backward()
         optimizer.step()
         scheduler.step()
