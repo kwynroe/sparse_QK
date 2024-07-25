@@ -22,8 +22,8 @@ def language_model_transcoder_runner_parallel(cfg):
     # Create and initialise transcoders.
     query_transcoder = SparseTranscoder(cfg, is_query=True)
     key_transcoder = SparseTranscoder(cfg, is_query=False)
-    query_transcoder.initialize_b_dec(activations_store, model.W_Q[cfg.layer], model.b_Q[cfg.layer])
-    key_transcoder.initialize_b_dec(activations_store, model.W_K[cfg.layer], model.b_K[cfg.layer])
+    query_transcoder.initialize_biases(activations_store, model.W_Q[cfg.layer], model.b_Q[cfg.layer])
+    key_transcoder.initialize_biases(activations_store, model.W_K[cfg.layer], model.b_K[cfg.layer])
 
     cfg.attn_scores_norm = cfg.d_head ** 0.5 if cfg.attn_scores_normed else 1   # TODO: maybe replace with model.cfg.attn_scale ??
 

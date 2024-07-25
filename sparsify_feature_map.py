@@ -53,7 +53,7 @@ def sparsity_transcoder(
         
         # define bias part of overall scores transcoder
         key_decoder_unflat = einops.rearrange(key_transcoder.W_dec, "d_hidden_K (n_head d_head) -> d_hidden_K n_head d_head", d_head=key_transcoder.d_head)
-        query_bias_unflat = einops.rearrange(query_transcoder.b_dec_out, "(n_head d_head) -> n_head d_head", d_head=query_transcoder.d_head)
+        query_bias_unflat = einops.rearrange(query_transcoder.b_out, "(n_head d_head) -> n_head d_head", d_head=query_transcoder.d_head)
         linear_key_feat_weights = einops.einsum(query_bias_unflat, key_decoder_unflat, "n_head d_head, d_hidden_K n_head d_head -> n_head d_hidden_K")
     
     with tqdm(total=total_training_tokens, desc="Training Mask") as pbar:
