@@ -11,13 +11,9 @@ from sparse_transcoder import SparseTranscoder
 from transcoder_training_parallel import train_transcoder_on_language_model_parallel
 
 
-def language_model_transcoder_runner_parallel(cfg):
+def language_model_transcoder_runner_parallel(cfg, model, activations_store):
     "Wrapper around transcoder training."
     print("Running...")
-
-    # Load model.
-    model = transformer_lens.HookedTransformer.from_pretrained(cfg.model_name, fold_ln=True)
-    activations_store = ActivationsStore(cfg, model)
 
     # Create and initialise transcoders.
     query_transcoder = SparseTranscoder(cfg, is_query=True)
@@ -38,6 +34,10 @@ def language_model_transcoder_runner_parallel(cfg):
         key_transcoder,
         activations_store,
     )
+    
+    # Fold in W_dec norms.
+    query_transcoder.fold_W_dec_norm()
+    key_transcoder.fold_W_dec_norm()
 
     # save transcoder.
     path_q = f"{cfg.checkpoint_path}/final_{query_transcoder.get_name()}.pt"
