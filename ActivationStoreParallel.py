@@ -24,44 +24,35 @@ class ActivationsStore:
         self.dataset = load_dataset(cfg.dataset_path, split="train", streaming=True, cache_dir="./cache")
         self.iterable_dataset = iter(self.dataset)
 
-        # check if it's tokenized
-        if "tokens" in next(self.iterable_dataset).keys():
-            self.cfg.is_dataset_tokenized = True
-            print("Dataset is tokenized! Updating config.")
-        elif "text" in next(self.iterable_dataset).keys():
-            self.cfg.is_dataset_tokenized = False
-            print("Dataset is not tokenized! Updating config.")
+        # Check if dataset is tokenized
+        sample = next(self.iterable_dataset)
+        self.cfg.is_dataset_tokenized = "tokens" in sample
+        print(f"Dataset is {'tokenized' if self.cfg.is_dataset_tokenized else 'not tokenized'}! Updating config.")
 
         if self.cfg.use_cached_activations:
-            # Sanity check: does the cache directory exist?
-            assert os.path.exists(
-                self.cfg.cached_activations_path
-            ), f"Cache directory {self.cfg.cached_activations_path} does not exist. Consider double-checking your dataset, model, and hook names."
-
-            self.next_cache_idx = 0  # which file to open next
-            self.next_idx_within_buffer = 0  # where to start reading from in that file
-
-            # Check that we have enough data on disk
-            first_buffer = torch.load(f"{self.cfg.cached_activations_path}/0.pt")
-            buffer_size_on_disk = first_buffer.shape[0]
-            n_buffers_on_disk = len(os.listdir(self.cfg.cached_activations_path))
-            # Note: we're assuming all files have the same number of tokens
-            # (which seems reasonable imo since that's what our script does)
-            n_activations_on_disk = buffer_size_on_disk * n_buffers_on_disk
-            assert (
-                n_activations_on_disk > self.cfg.total_training_tokens
-            ), f"Only {n_activations_on_disk/1e6:.1f}M activations on disk, but cfg.total_training_tokens is {self.cfg.total_training_tokens/1e6:.1f}M."
-
-            # TODO add support for "mixed loading" (ie use cache until you run out, then switch over to streaming from HF)
+            self._setup_cached_activations()
 
         if create_dataloader:
             # fill buffer half a buffer, so we can mix it with a new buffer
             self.storage_buffer = self.get_buffer(self.cfg.n_batches_in_buffer // 2)
             self.dataloader = self.get_data_loader()
 
+    def _setup_cached_activations(self):
+        assert os.path.exists(self.cfg.cached_activations_path), f"Cache directory {self.cfg.cached_activations_path} does not exist."
+        
+        self.next_cache_idx = 0
+        self.next_idx_within_buffer = 0
+
+        first_buffer = torch.load(f"{self.cfg.cached_activations_path}/0.pt")
+        buffer_size_on_disk = first_buffer.shape[0]
+        n_buffers_on_disk = len(os.listdir(self.cfg.cached_activations_path))
+        n_activations_on_disk = buffer_size_on_disk * n_buffers_on_disk
+
+        assert n_activations_on_disk > self.cfg.total_training_tokens, f"Only {n_activations_on_disk/1e6:.1f}M activations on disk, but cfg.total_training_tokens is {self.cfg.total_training_tokens/1e6:.1f}M."
+
     def get_batch_tokens(self):
         """
-        Streams a batch of tokens from a dataset.
+        Streams a batch of tokens from a dataset. - of batch_size x context_size (?)
         """
 
         batch_size = self.cfg.store_batch_size

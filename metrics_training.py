@@ -61,7 +61,7 @@ class WandbLogger:
         ):
         #Calculate average max pattern error and fraction of contexts where reconstruction correctly identified most interesting source token
         #Not very rigorous but helpful to plot while training!
-        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr))), dim = -1).values.mean()
+        patt_max_diff = torch.max(torch.abs((torch.exp(true_patt_flat) - torch.exp(patt_full_reconstr))), dim = -1).values.mean().mean()
         frac_accurate = (torch.argmax(patt_full_reconstr, dim = -1) == torch.argmax(true_patt_flat, dim = -1)).float().mean()
         
         # Calculate the sparsities, and add it to a list, calculate sparsity metrics
@@ -71,13 +71,13 @@ class WandbLogger:
         wandb.log(
             {
                 # losses
+                "losses/patt_loss_full": patt_loss_full_pred.item(),
+                "losses/patt_lossQ": patt_loss_true_keys.item(),
+                "losses/patt_lossK": patt_loss_true_queries.item(),
                 "losses/mse_lossQ": mse_lossQ.item(),
                 "losses/mse_lossK": mse_lossK.item(),
                 "losses/reg_lossQ": reg_lossQ.item(),
                 "losses/reg_lossK": reg_lossK.item(),
-                "losses/patt_lossQ": patt_loss_true_keys.item(),
-                "losses/patt_lossK": patt_loss_true_queries.item(),
-                "losses/patt_loss_full": patt_loss_full_pred.item(),
                 
                 # metrics
                 "metrics/full_pred_diff": attn_scores_loss_full_pred.item(),  # TODO: this is without causal mask, so a weird thing to track??
