@@ -1,3 +1,5 @@
+
+
 import gzip
 import os
 import pickle
@@ -57,7 +59,7 @@ class SparseTranscoder_OV(HookedRootModule):
         )
         if cfg.norming_decoder_during_training:
             self.set_decoder_norm_to_unit_norm()
-        self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.dtype, device=self.device))
+        #self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.dtype, device=self.device))
         self.b_dec_out = nn.Parameter(torch.zeros(self.d_out, dtype=self.dtype, device=self.device))
 
         self.gamma = nn.Parameter(torch.ones(self.d_hidden_K, self.d_hidden, dtype=self.dtype, device=self.device))
@@ -74,7 +76,7 @@ class SparseTranscoder_OV(HookedRootModule):
         # move x to correct dtype
         x = x.to(self.dtype)
         transcoder_in = self.hook_transcoder_in(
-            x - self.b_dec
+            x #- self.b_dec
         )  # Remove encoder bias as per Anthropic
 
         hidden_pre = self.hook_hidden_pre(
@@ -86,8 +88,8 @@ class SparseTranscoder_OV(HookedRootModule):
             + self.b_enc
         )
         
+        feature_actsK = (feature_actsK > 0).float()
         gamma_acts = einops.einsum(feature_actsK, self.gamma, " ... d_hiddenK, d_hiddenK d_hiddenV -> ... d_hiddenV")
-        gamma_acts = (gamma_acts > 0).float()
         feature_acts = self.hook_hidden_post(torch.nn.functional.relu(hidden_pre))
         feature_acts = feature_acts * gamma_acts
         transcoder_out = self.hook_transcoder_out(einops.einsum(
