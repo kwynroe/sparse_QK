@@ -57,8 +57,8 @@ class SparseTranscoder(HookedRootModule):
         )
         if cfg.norming_decoder_during_training:
             self.set_decoder_norm_to_unit_norm()
-        self.b_dec = nn.Parameter(torch.zeros(self.d_in, dtype=self.dtype, device=self.device))
-        self.b_dec_out = nn.Parameter(torch.zeros(self.d_out, dtype=self.dtype, device=self.device))
+        self.b_pre = nn.Parameter(torch.zeros(self.d_in, dtype=self.dtype, device=self.device))
+        self.b_out = nn.Parameter(torch.zeros(self.d_out, dtype=self.dtype, device=self.device))
 
         self.hook_transcoder_in = HookPoint()
         self.hook_hidden_pre = HookPoint()
@@ -71,7 +71,7 @@ class SparseTranscoder(HookedRootModule):
         # move x to correct dtype
         x = x.to(self.dtype)
         transcoder_in = self.hook_transcoder_in(
-            x - self.b_dec
+            x - self.b_pre * (not self.cfg.disable_b_pre)
         )  # Remove encoder bias as per Anthropic
 
         hidden_pre = self.hook_hidden_pre(
@@ -88,12 +88,19 @@ class SparseTranscoder(HookedRootModule):
                 feature_acts,
                 self.W_dec,
                 "... d_hidden, d_hidden d_in -> ... d_in",
-            ) + self.b_dec_out
+            ) + self.b_out
         )
         
         lp_norm = self.reg_loss(feature_acts)
 
         return transcoder_out, feature_acts, lp_norm
+    
+    @torch.no_grad()
+    def fold_W_dec_norm(self):
+        W_dec_norms = self.W_dec.norm(dim=-1).unsqueeze(1)
+        self.W_dec.data = self.W_dec.data / W_dec_norms
+        self.W_enc.data = self.W_enc.data * W_dec_norms.T
+        self.b_enc.data = self.b_enc.data * W_dec_norms.squeeze()
     
 
     def reg_loss(self, feature_acts, p=0.5):
@@ -105,52 +112,22 @@ class SparseTranscoder(HookedRootModule):
         return torch.sqrt(scaled_feature_acts.float().abs() + self.eps).sum()    # this isnt actually the l0.5 norm, but its sqrt??
 
     @torch.no_grad()
-    def initialize_b_dec(self, activation_store, model_W=None, model_b=None):
-        if self.cfg.b_dec_init_method == "mean":
+    def initialize_biases(self, activation_store, model_W=None, model_b=None):
+        if self.cfg.biases_init_method == "mean":
             if model_W is None or model_b is None:
-                raise ValueError("Model weights required for mean initialisation in initialise_b_dec.")
-            self.initialize_b_dec_with_mean(activation_store)
-            self.initialize_b_dec_out_with_mean(activation_store, model_W, model_b)
-        elif self.cfg.b_dec_init_method == "zeros":
+                raise ValueError("Model weights required for mean initialisation in initialise_b_pre.")
+
+            previous_b_pre = self.b_pre.clone().cpu()
+            previous_b_out = self.b_out.clone().cpu()
+            b_pre = initialize_b_pre_with_mean(previous_b_pre, activation_store)
+            b_out = initialize_b_out_with_mean(previous_b_out, activation_store, model_W, model_b)
+            self.b_pre.data = b_pre.to(self.dtype).to(self.device)
+            self.b_out.data = b_out.to(self.dtype).to(self.device)
+        elif self.cfg.biases_init_method == "zeros":
             pass
         else:
-            raise ValueError(f"Unexpected b_dec_init_method: {self.cfg.b_dec_init_method}")
-
-
-    @torch.no_grad()
-    def initialize_b_dec_with_mean(self, activation_store):
-
-        previous_b_dec = self.b_dec.clone().cpu()
-        all_activations = activation_store.storage_buffer.detach().cpu()
-        out = all_activations.mean(dim=0)
-
-        previous_distances = torch.norm(all_activations - previous_b_dec, dim=-1)
-        distances = torch.norm(all_activations - out, dim=-1)
-
-        print("Reinitializing b_dec with mean of activations")
-        print(f"Previous distances: {previous_distances.median(0).values.mean().item()}")
-        print(f"New distances: {distances.median(0).values.mean().item()}")
-
-        self.b_dec.data = out.to(self.dtype).to(self.device)
-
-    @torch.no_grad()
-    def initialize_b_dec_out_with_mean(self, activation_store, model_W, model_b):
-
-        previous_b_dec_out = self.b_dec_out.clone().cpu()
-        all_activations = activation_store.storage_buffer.detach()
-        all_activations = einops.einsum(all_activations, model_W, "... d_model, n_head d_model d_head -> ... n_head d_head") + model_b
-        all_activations = einops.rearrange(all_activations, "... n_head d_head -> ... (n_head d_head)")
-        all_activations = all_activations.cpu()
-        out = all_activations.mean(dim=0)
-
-        previous_distances = torch.norm(all_activations - previous_b_dec_out, dim=-1)
-        distances = torch.norm(all_activations - out, dim=-1)
-
-        print("Reinitializing b_dec_out with mean of activations")
-        print(f"Previous distances: {previous_distances.median(0).values.mean().item()}")
-        print(f"New distances: {distances.median(0).values.mean().item()}")
-
-        self.b_dec.data = out.to(self.dtype).to(self.device)
+            raise ValueError(f"Unexpected biases_init_method: {self.cfg.biases_init_method}")
+        
 
     @torch.no_grad()
     def get_test_loss(self, batch_tokens, model, replace):
@@ -281,3 +258,40 @@ class SparseTranscoder(HookedRootModule):
             f"sparse_transcoder_{self.cfg.model_name}_{this_type}_{self.cfg.d_hidden}"
         )
         return transcoder_name
+
+
+
+
+@torch.no_grad()
+def initialize_b_pre_with_mean(previous_b_pre, activation_store):
+
+    all_activations = activation_store.storage_buffer.detach().cpu()
+    out = all_activations.mean(dim=0)
+
+    previous_distances = torch.norm(all_activations - previous_b_pre, dim=-1)
+    distances = torch.norm(all_activations - out, dim=-1)
+
+    print("Reinitializing b_pre with mean of activations")
+    print(f"Previous distances: {previous_distances.median(0).values.mean().item()}")
+    print(f"New distances: {distances.median(0).values.mean().item()}")
+    
+    return out
+
+
+@torch.no_grad()
+def initialize_b_out_with_mean(previous_b_out, activation_store, model_W, model_b):
+
+    all_activations = activation_store.storage_buffer.detach()
+    all_activations = einops.einsum(all_activations, model_W, "... d_model, n_head d_model d_head -> ... n_head d_head") + model_b
+    all_activations = einops.rearrange(all_activations, "... n_head d_head -> ... (n_head d_head)")
+    all_activations = all_activations.cpu()
+    out = all_activations.mean(dim=0)
+
+    previous_distances = torch.norm(all_activations - previous_b_out, dim=-1)
+    distances = torch.norm(all_activations - out, dim=-1)
+
+    print("Reinitializing b_out with mean of activations")
+    print(f"Previous distances: {previous_distances.median(0).values.mean().item()}")
+    print(f"New distances: {distances.median(0).values.mean().item()}")
+
+    return out
