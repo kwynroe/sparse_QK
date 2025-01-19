@@ -12,7 +12,7 @@ import einops
 import wandb
 from ActivationStoreParallel import ActivationsStore
 from optimize import get_scheduler
-from sparse_transcoder import SparseTranscoder
+from QK_composition.sparse_transcoder import SparseTranscoder
 import torch.nn.functional as F
 
 def apply_causal_mask(attn_scores):

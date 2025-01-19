@@ -1,17 +1,16 @@
 import os
-
 import torch
 import transformer_lens
 import wandb
 
 from ActivationStoreParallel import ActivationsStore
-from sparse_transcoder_OV import SparseTranscoder_OV
+from OV_decomposition.sparse_transcoder_OV import SparseTranscoder_OV
 
 # from sae_training.activation_store import ActivationStore
-from OV_transcoder_train import train_OV_transcoder
+from OV_decomposition.OV_transcoder_train import train_OV_model
 
 
-def OV_transcoder_runner_parallel(cfg, key_transcoder):
+def OV_decomposition_runner(cfg, key_transcoder):
     "Wrapper around transcoder training."
     print("Running...")
 

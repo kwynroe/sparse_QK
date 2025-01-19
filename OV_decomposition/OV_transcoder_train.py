@@ -11,7 +11,7 @@ import einops
 import wandb
 from ActivationStoreParallel import ActivationsStore
 from optimize import get_scheduler
-from sparse_transcoder import SparseTranscoder
+from QK_composition.QK_model import qk_model
 
 def apply_causal_mask(attn_scores):
         mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1)).cuda(), diagonal=1).bool()
@@ -24,7 +24,7 @@ def train_OV_transcoder(
     cfg,
     model: HookedTransformer,
     transcoder,
-    key_transcoder,
+    key_model,
     activation_store: ActivationsStore,
     batch_size: int = 1024,
     n_checkpoints: int = 0,
@@ -92,7 +92,7 @@ def train_OV_transcoder(
         true_patt = apply_causal_mask(true_scores).softmax(-1)
         attn_out = einops.einsum(post, true_patt, "batch posnK n_head d_model, batch n_head posnQ posnK -> batch posnQ n_head d_model")
         attn_out = einops.rearrange(attn_out, "... n_head d_head -> ... (n_head d_head)")
-        _, feature_actsK, _ = key_transcoder(flatten_heads(true_keys))
+        _, feature_actsK, _ = key_model(flatten_heads(true_keys))
         
         # Forward and Backward Passes
         reconstr_post, feature_acts, reg_loss, gamma_reg_loss = transcoder(
@@ -188,7 +188,7 @@ def train_OV_transcoder(
 
         loss.backward()
         #transcoder.remove_gradient_parallel_to_decoder_directions()
-        #key_transcoder.remove_gradient_parallel_to_decoder_directions()
+        #key_model.remove_gradient_parallel_to_decoder_directions()
         optimizer.step()
         
         with torch.no_grad():
