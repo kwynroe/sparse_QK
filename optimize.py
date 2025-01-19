@@ -4,11 +4,6 @@ from typing import Optional
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 
-
-#  None
-#  Linear Warmup and decay
-#  Cosine Annealing with Warmup
-#  Cosine Annealing with Warmup / Restarts
 def get_scheduler(
     scheduler_name: Optional[str], optimizer: optim.Optimizer, **kwargs
 ):
